@@ -173,6 +173,13 @@ def make_data_loader(cfg, mode='train', is_distributed=False, start_iter=0):
     assert mode in {'train', 'val', 'test'}
     num_gpus = get_world_size()
     is_train = mode == 'train'
+
+    ##################train_data
+    #is_train=False
+    ####################
+
+
+
     if is_train:
         images_per_batch = cfg.SOLVER.IMS_PER_BATCH
         assert (
@@ -255,21 +262,86 @@ def make_data_loader(cfg, mode='train', is_distributed=False, start_iter=0):
     ##########统计关系个数 ########数据形式ndarray
     relation_count=[]
     relation_stat={}
+    relation_count_stat={}
+    relation_context_stat={}
+    relation_context_stat_sub = {}
+    relation_context_stat_obj = {}
     obj_stat={}
+    data_idx=0
+    context_stat = {}
     for relation in datasets[0].relationships:
         relation_count.append(len(relation))
+        relation_label=relation[:,-1]
+
+        subject_index = relation[:, 0]
+        object_index = relation[:, 1]
+        for sub,obj,rel in zip(subject_index,object_index,relation_label):
+            subject_label=datasets[0].gt_classes[data_idx][sub]
+            object_label = datasets[0].gt_classes[data_idx][obj]
+            subject_text = datasets[0].ind_to_classes[subject_label]
+            object_text = datasets[0].ind_to_classes[object_label]
+            context=str(subject_text+"-"+object_text)
+            if context not in context_stat:
+                context_stat[context] = 1
+            else:
+                context_stat[context] += 1
+            if datasets[0].ind_to_predicates[rel] not in relation_context_stat:
+                relation_context_stat[datasets[0].ind_to_predicates[rel]] = {}
+            else:
+                if context not in relation_context_stat[datasets[0].ind_to_predicates[rel]]:
+                    relation_context_stat[datasets[0].ind_to_predicates[rel]][context] = 1
+                else:
+                    relation_context_stat[datasets[0].ind_to_predicates[rel]][context] += 1
+
+            if datasets[0].ind_to_predicates[rel] not in relation_context_stat_sub:
+                relation_context_stat_sub[datasets[0].ind_to_predicates[rel]] = {}
+            else:
+                if subject_text not in relation_context_stat_sub[datasets[0].ind_to_predicates[rel]]:
+                    relation_context_stat_sub[datasets[0].ind_to_predicates[rel]][subject_text] = 1
+                else:
+                    relation_context_stat_sub[datasets[0].ind_to_predicates[rel]][subject_text] += 1
+
+
+            if datasets[0].ind_to_predicates[rel] not in relation_context_stat_obj:
+                relation_context_stat_obj[datasets[0].ind_to_predicates[rel]] = {}
+            else:
+                if object_text not in relation_context_stat_obj[datasets[0].ind_to_predicates[rel]]:
+                    relation_context_stat_obj[datasets[0].ind_to_predicates[rel]][object_text] = 1
+                else:
+                    relation_context_stat_obj[datasets[0].ind_to_predicates[rel]][object_text] += 1
+
+
+
+        for r in relation_label:
+            if datasets[0].ind_to_predicates[r] not in relation_count_stat:
+                relation_count_stat[datasets[0].ind_to_predicates[r]] = 1
+            else:
+                relation_count_stat[datasets[0].ind_to_predicates[r]] += 1
         #print(str(len(relation)) in relation_stat)
         if len(relation) not in relation_stat:
             relation_stat[len(relation)] = 1
         else:
             relation_stat[len(relation)] += 1
+        data_idx+=1
 
     for objects in datasets[0].gt_classes:
         for i in objects:
-            if i not in obj_stat:
-                obj_stat[i]=1
+            if datasets[0].ind_to_classes[i] not in obj_stat:
+                obj_stat[datasets[0].ind_to_classes[i]]=1
             else:
-                obj_stat[i] += 1
+                obj_stat[datasets[0].ind_to_classes[i]] += 1
+    relation_keys=list(relation_context_stat.keys())
+    rel_and={}
+    rel_and_count=[]
+    # for i in range(len(relation_keys)-1):
+    #     key1=relation_context_stat[relation_keys[0]].keys()
+    #     key2 = relation_context_stat[relation_keys[i+1]].keys()
+    #     intersection = key1 & key2
+    #     rel_and[i]=list(intersection)
+    #     rel_and_count.append(len(rel_and[i])/len(list(key2)))
+    #     aaaa=1
+
+
 
 
 
@@ -281,25 +353,32 @@ def make_data_loader(cfg, mode='train', is_distributed=False, start_iter=0):
     wb = xlwt.Workbook()
     # 添加一个表
     ws = wb.add_sheet('test')
-    for rel_num,stat in relation_stat.items():
+    for rel_name,count in relation_context_stat_sub['on'].items():
             i += 1
-            ws.write(i, 1, stat)
-            ws.write(i, 0, rel_num)
-            wb.save('./relstat_1.xls')
-    sort_dict=sorted(relation_stat.items(),key=lambda s:s[0])
+            ws.write(i, 0, rel_name)
+            ws.write(i, 1, count)
+            wb.save('./on_intra_class_sub_test.xls')
 
 
-    import numpy as np
-    maxcount=np.max(relation_count)
-
-    wb1 = xlwt.Workbook()
-    # 添加一个表
-    ws1 = wb1.add_sheet('test1')
-    for obj_num,stat in obj_stat.items():
-            i += 1
-            ws1.write(i, 1, stat)
-            ws1.write(i, 0, int(obj_num))
-            wb1.save('./objstat_1.xls')
+    # for rel_num,stat in relation_stat.items():
+    #         i += 1
+    #         ws.write(i, 1, stat)
+    #         ws.write(i, 0, rel_num)
+    #         wb.save('./relstat_1.xls')
+    # sort_dict=sorted(relation_stat.items(),key=lambda s:s[0])
+    #
+    #
+    # import numpy as np
+    # maxcount=np.max(relation_count)
+    #
+    # wb1 = xlwt.Workbook()
+    # # 添加一个表
+    # ws1 = wb1.add_sheet('test1')
+    # for obj_num,stat in obj_stat.items():
+    #         i += 1
+    #         ws1.write(i, 1, stat)
+    #         ws1.write(i, 0, int(obj_num))
+    #         wb1.save('./objstat_1.xls')
 
 
 
