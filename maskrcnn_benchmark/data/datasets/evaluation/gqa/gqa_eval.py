@@ -19,6 +19,8 @@ def do_gqa_evaluation(
     num_attributes = cfg.MODEL.ROI_ATTRIBUTE_HEAD.NUM_ATTRIBUTES
     # extract evaluation settings from cfg
     # mode = cfg.TEST.RELATION.EVAL_MODE
+    ##############myout#########
+    myoutfold = '02causal'
     if cfg.MODEL.ROI_RELATION_HEAD.USE_GT_BOX:
         if cfg.MODEL.ROI_RELATION_HEAD.USE_GT_OBJECT_LABEL:
             mode = 'predcls'
@@ -43,7 +45,7 @@ def do_gqa_evaluation(
         gt = dataset.get_groundtruth(image_id, evaluation=True)
         groundtruths.append(gt)
 
-    save_output(output_folder, groundtruths, predictions, dataset)
+    save_output(output_folder, groundtruths, predictions, dataset,myoutfold)
     
     result_str = '\n' + '=' * 100 + '\n'
 
@@ -114,10 +116,15 @@ def do_gqa_evaluation(
         return -1
 
 
-def save_output(output_folder, groundtruths, predictions, dataset):
+def save_output(output_folder, groundtruths, predictions, dataset,myoutfold):
     if output_folder:
-        torch.save({'groundtruths':groundtruths, 'predictions':predictions}, os.path.join(output_folder, "eval_results.pytorch"))
+        # torch.save({'groundtruths':groundtruths, 'predictions':predictions}, os.path.join(output_folder, "eval_results.pytorch"))
 
+        #######myout
+        from maskrcnn_benchmark.utils.miscellaneous import mkdir
+        mkdir(os.path.join(output_folder,myoutfold))
+        torch.save({'groundtruths': groundtruths, 'predictions': predictions},
+                   os.path.join(output_folder,myoutfold, "eval_results.pytorch"))
         #with open(os.path.join(output_folder, "result.txt"), "w") as f:
         #    f.write(result_str)
         # visualization information
@@ -137,7 +144,11 @@ def save_output(output_folder, groundtruths, predictions, dataset):
                 'groundtruth': groundtruth,
                 'prediction': prediction
                 })
-        with open(os.path.join(output_folder, "visual_info.json"), "w") as f:
+        # with open(os.path.join(output_folder, "visual_info.json"), "w") as f:
+        #     json.dump(visual_info, f)
+
+        ################myout##############
+        with open(os.path.join(output_folder,myoutfold, "visual_info.json"), "w") as f:
             json.dump(visual_info, f)
 
 

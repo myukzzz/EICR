@@ -30,7 +30,7 @@ class SceneGraphEvaluation(ABC):
         print("Generate Print String")
         pass
 def rel_nms(pred_boxes, pred_classes, pred_rel_inds, rel_scores, nms_thresh=0.5, l21_thr=0.7):
-    # rel_scores N*50——交集面积除以并集面积
+###########pred_boxes-N*4;pred_classes-N;pred_rel_inds-N*(N-1)*2;rel_scores-logits;
     ious = bbox_overlaps(pred_boxes, pred_boxes)#rel_scores N*N-N 所有可能的pair的logit
     sub_ious = ious[pred_rel_inds[:,0]][:,pred_rel_inds[:,0]]#pred_rel_inds N*N-N 所有可能的pair
     obj_ious = ious[pred_rel_inds[:,1]][:,pred_rel_inds[:,1]]
@@ -41,6 +41,9 @@ def rel_nms(pred_boxes, pred_classes, pred_rel_inds, rel_scores, nms_thresh=0.5,
     bbbbbbbbb=rel_scores[None, :, :]
     #N*N-N 1 C 和 1 N*N-N C;isoverlap:SO相同，IOU高，但predlogits不一样
     l21 = np.sqrt((np.power(rel_scores[:,None,:],2.0)+np.power(rel_scores[None,:,:],2.0))).sum(axis=-1)#l21-各个关系之间的特征logits平方和——logits越远离值越大（没用）
+    subj_dis=sub_labels[:,None]==sub_labels[None,:]
+    obj_dis=obj_labels[:,None]==obj_labels[None,:]
+
     is_overlap = (rel_ious >= nms_thresh) & (sub_labels[:,None]==sub_labels[None,:])&(obj_labels[:,None]==obj_labels[None,:])&(l21 > l21_thr)
     is_overlap = is_overlap[:,:,None].repeat(rel_scores.shape[1],axis=2)
 
@@ -98,7 +101,7 @@ class SGRecall(SceneGraphEvaluation):
         if mode == 'predcls' or mode == 'sgcls':
             pred_rels, pred_scores = rel_nms(pred_boxes, pred_classes, pred_rel_inds, rel_scores, 0.5)
             pred_rels = np.column_stack((pred_rel_inds, pred_rels))
-            sort_idx = np.argsort(-(pred_scores*obj_scores[pred_rel_inds[:,0]]*obj_scores[pred_rel_inds[:,0]]))
+            sort_idx = np.argsort(-(pred_scores*obj_scores[pred_rel_inds[:,0]]*obj_scores[pred_rel_inds[:,0]]))##########此处有错误？应该是pred_rel_inds 1
             pred_rels = pred_rels[sort_idx]
             pred_scores = pred_scores[sort_idx]
 
@@ -124,7 +127,7 @@ class SGRecall(SceneGraphEvaluation):
 
         for k in self.result_dict[mode + '_recall']:
             # the following code are copied from Neural-MOTIFS
-            match = reduce(np.union1d, pred_to_gt[:k])
+            match = reduce(np.union1d, pred_to_gt[:k])#reduce(function, iterable[, initializer])_union1d-排序并集
             rec_i = float(len(match)) / float(gt_rels.shape[0])#Recall-匹配数/总数
             self.result_dict[mode + '_recall'][k].append(rec_i)
 
@@ -216,7 +219,7 @@ class SGZeroShotRecall(SceneGraphEvaluation):
         sub_id, ob_id, pred_label = gt_rels[:, 0], gt_rels[:, 1], gt_rels[:, 2]
         gt_triplets = np.column_stack((gt_classes[sub_id], gt_classes[ob_id], pred_label))  # num_rel, 3
 
-        self.zeroshot_idx = np.where( intersect_2d(gt_triplets, zeroshot_triplets).sum(-1) > 0 )[0].tolist()
+        self.zeroshot_idx = np.where(intersect_2d(gt_triplets, zeroshot_triplets).sum(-1) > 0 )[0].tolist()# num_rel,判断是否属于ZS——ZS为未见过的组合，并非OV
 
     def calculate_recall(self, global_container, local_container, mode):
         pred_to_gt = local_container['pred_to_gt']
@@ -411,7 +414,7 @@ class SGMeanRecall(SceneGraphEvaluation):
         for k in self.result_dict[mode + '_mean_recall_collect']:#20 50 100
             # the following code are copied from Neural-MOTIFS
             match = reduce(np.union1d, pred_to_gt[:k])
-            # NOTE: by kaihua, calculate Mean Recall for each category independently
+            # NOTE: by xxxxx, calculate Mean Recall for each category independently
             # this metric is proposed by: CVPR 2019 oral paper "Learning to Compose Dynamic Tree Structures for Visual Contexts"
             recall_hit = [0] * self.num_rel
             recall_count = [0] * self.num_rel
@@ -588,7 +591,7 @@ class SGNGMeanRecall(SceneGraphEvaluation):
         for k in self.result_dict[mode + '_ng_mean_recall_collect']:
             # the following code are copied from Neural-MOTIFS
             match = reduce(np.union1d, pred_to_gt[:k])
-            # NOTE: by kaihua, calculate Mean Recall for each category independently
+            # NOTE: by xxxxx, calculate Mean Recall for each category independently
             # this metric is proposed by: CVPR 2019 oral paper "Learning to Compose Dynamic Tree Structures for Visual Contexts"
             recall_hit = [0] * self.num_rel
             recall_count = [0] * self.num_rel
@@ -694,7 +697,7 @@ def _compute_pred_matches(gt_triplets, pred_triplets,
                                          keeps[gt_has_match],
                                          ):
         boxes = pred_boxes[keep_inds]
-        if phrdet:
+        if phrdet:#false
             # Evaluate where the union box > 0.5
             gt_box_union = gt_box.reshape((2, 4))
             gt_box_union = np.concatenate((gt_box_union.min(0)[:2], gt_box_union.max(0)[2:]), 0)
