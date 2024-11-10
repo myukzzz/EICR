@@ -310,7 +310,7 @@ class LSTMContext(nn.Module):
         self.nl_edge = self.cfg.MODEL.ROI_RELATION_HEAD.CONTEXT_REL_LAYER
         assert self.nl_obj > 0 and self.nl_edge > 0
 
-        # TODO Kaihua Tang
+        # TODO xxxxx xxx
         # AlternatingHighwayLSTM is invalid for pytorch 1.0
         self.obj_ctx_rnn = torch.nn.LSTM(
                 input_size=self.obj_dim+self.embed_dim + 128,
@@ -534,8 +534,9 @@ class LSTMContext(nn.Module):
 
 
 
-    def forward(self, x, proposals, rel_pair_idxs, logger=None, all_average=False, ctx_average=False):
+    def forward(self, x, proposals, rel_pair_idxs, logger=None, all_average=False, ctx_average=False,return_pos=False):
         # labels will be used in DecoderRNN during training (for nms)
+        ##########x ROIfeat
         if self.training or self.cfg.MODEL.ROI_RELATION_HEAD.USE_GT_BOX:
             obj_labels = cat([proposal.get_field("labels") for proposal in proposals], dim=0)
         else:
@@ -584,9 +585,9 @@ class LSTMContext(nn.Module):
         if (all_average or ctx_average) and self.effect_analysis and (not self.training):
             obj_rel_rep = cat((self.untreated_edg_feat.view(1, -1).expand(batch_size, -1), obj_ctx), dim=-1)
         else:####################
-            obj_rel_rep = cat((obj_embed2, x, obj_ctx), -1)
+            obj_rel_rep = cat((obj_embed2, x, obj_ctx), -1)#200+4096+512
             
-        edge_ctx = self.edge_ctx(obj_rel_rep, perm=perm, inv_perm=inv_perm, ls_transposed=ls_transposed)#也是过LSTM
+        edge_ctx = self.edge_ctx(obj_rel_rep, perm=perm, inv_perm=inv_perm, ls_transposed=ls_transposed)#也是过LSTM,SO特征
 
         # memorize average feature
         if self.training and self.effect_analysis:###############没用
@@ -596,6 +597,8 @@ class LSTMContext(nn.Module):
         if self.use_CLIP:
             return obj_dists, obj_preds, edge_ctx, scoremaps
         #target,labels,edges
+        if return_pos==True:
+            return obj_dists, obj_preds, edge_ctx, pos_embed,obj_embed2
         return obj_dists, obj_preds, edge_ctx, None
 
 

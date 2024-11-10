@@ -118,7 +118,7 @@ class PostProcessor(nn.Module):
 
         return boxlist
 
-    # discarded by kaihua
+    # discarded by xxxxx
     def jiaxin_undo_regression(self, i, boxes, orig_inds, boxlist, boxes_per_img):
         # by Jiaxin
         selected_boxes = boxes[i][orig_inds]
@@ -186,7 +186,7 @@ class PostProcessor(nn.Module):
             result.append(boxlist_for_class)
             orig_inds.append(inds)
 
-        #NOTE: kaihua, according to Neural-MOTIFS (and my experiments, we need remove duplicate bbox)
+        #NOTE: xxxxx, according to Neural-MOTIFS (and my experiments, we need remove duplicate bbox)
         if self.nms_filter_duplicates or self.save_proposals:
             assert len(orig_inds) == (num_classes - 1)
             # set all bg to zero

@@ -47,7 +47,7 @@ class ResNet50Conv5ROIFeatureExtractor(nn.Module):
 
 
 @registry.ROI_BOX_FEATURE_EXTRACTORS.register("FPN2MLPFeatureExtractor")
-class FPN2MLPFeatureExtractor(nn.Module):
+class FPN2MLPFeatureExtractor(nn.Module):######################################
     """
     Heads for FPN for classification
     """

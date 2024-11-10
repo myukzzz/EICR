@@ -40,7 +40,7 @@ class LSTMContext_visual(nn.Module):
         self.nl_edge = self.cfg.MODEL.ROI_RELATION_HEAD.CONTEXT_REL_LAYER
         assert self.nl_obj > 0 and self.nl_edge > 0
 
-        # TODO Kaihua Tang
+        # TODO xxxxx xxx
         # AlternatingHighwayLSTM is invalid for pytorch 1.0
         self.obj_ctx_rnn = torch.nn.LSTM(
                 input_size=self.obj_dim,
@@ -217,7 +217,7 @@ class LSTMContext_semantic(nn.Module):
         self.nl_edge = self.cfg.MODEL.ROI_RELATION_HEAD.CONTEXT_REL_LAYER
         assert self.nl_obj > 0 and self.nl_edge > 0
 
-        # TODO Kaihua Tang
+        # TODO xxxxx xxx
         # AlternatingHighwayLSTM is invalid for pytorch 1.0
         self.obj_ctx_rnn = torch.nn.LSTM(
             input_size=self.embed_dim,
@@ -403,7 +403,7 @@ class LSTMContext_spatial(nn.Module):
         self.nl_edge = self.cfg.MODEL.ROI_RELATION_HEAD.CONTEXT_REL_LAYER
         assert self.nl_obj > 0 and self.nl_edge > 0
 
-        # TODO Kaihua Tang
+        # TODO xxxxx xxx
         # AlternatingHighwayLSTM is invalid for pytorch 1.0
         self.obj_ctx_rnn = torch.nn.LSTM(
             input_size=128,

@@ -240,7 +240,7 @@ class TransformerContext(nn.Module):
                                                 self.v_dim, self.hidden_dim, self.inner_dim, self.dropout_rate)
 
     
-    def forward(self, roi_features, proposals, logger=None):
+    def forward(self, roi_features, proposals, logger=None,return_pos=False):
         # labels will be used in DecoderRNN during training
         use_gt_label = self.training or self.cfg.MODEL.ROI_RELATION_HEAD.USE_GT_OBJECT_LABEL
         obj_labels = cat([proposal.get_field("labels") for proposal in proposals], dim=0) if use_gt_label else None
@@ -266,7 +266,8 @@ class TransformerContext(nn.Module):
         if self.mode == 'predcls':
             obj_preds = obj_labels
             obj_dists = to_onehot(obj_preds, self.num_obj_cls)
-            edge_pre_rep = cat((roi_features, obj_feats, self.obj_embed2(obj_labels)), dim=-1)
+            obj_embed2 = self.obj_embed2(obj_labels)
+            edge_pre_rep = cat((roi_features, obj_feats, obj_embed2), dim=-1)
         else:
             obj_dists = self.out_obj(obj_feats)
             use_decoder_nms = self.mode == 'sgdet' and not self.training
@@ -275,11 +276,14 @@ class TransformerContext(nn.Module):
                 obj_preds = self.nms_per_cls(obj_dists, boxes_per_cls, num_objs)
             else:
                 obj_preds = obj_dists[:, 1:].max(1)[1] + 1
-            edge_pre_rep = cat((roi_features, obj_feats, self.obj_embed2(obj_preds)), dim=-1)
+            obj_embed2=self.obj_embed2(obj_preds)
+            edge_pre_rep = cat((roi_features, obj_feats, obj_embed2), dim=-1)
 
         # edge context
         edge_pre_rep = self.lin_edge(edge_pre_rep)
         edge_ctx = self.context_edge(edge_pre_rep, num_objs)
+        if return_pos==True:
+            return obj_dists, obj_preds, edge_ctx, pos_embed,obj_embed2
 
         return obj_dists, obj_preds, edge_ctx
 

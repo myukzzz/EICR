@@ -229,7 +229,7 @@ class AttributeLSTMContext(nn.Module):
         self.nl_edge = self.cfg.MODEL.ROI_RELATION_HEAD.CONTEXT_REL_LAYER
         assert self.nl_obj > 0 and self.nl_edge > 0
 
-        # TODO Kaihua Tang
+        # TODO xxxxx xxx
         # AlternatingHighwayLSTM is invalid for pytorch 1.0
         self.obj_ctx_rnn = torch.nn.LSTM(
                 input_size=self.obj_dim+self.embed_dim*2 + 128,

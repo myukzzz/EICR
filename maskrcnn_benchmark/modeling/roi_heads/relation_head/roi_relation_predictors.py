@@ -23,7 +23,7 @@ from maskrcnn_benchmark.data import get_dataset_statistics
 
 from SHA_GCL_extra.utils_funcion import FrequencyBias_GCL
 from SHA_GCL_extra.extra_function_utils import generate_num_stage_vector, generate_sample_rate_vector, \
-    generate_current_sequence_for_bias, get_current_predicate_idx,generate_weight_rate_vector
+    generate_current_sequence_for_bias, get_current_predicate_idx,generate_weight_rate_vector,generate_sample_rate_vector_over,generate_weight_rate_vector_over,sample_rate_vector
 from SHA_GCL_extra.group_chosen_function import get_group_splits
 import random
 
@@ -43,7 +43,7 @@ from copy import deepcopy
 import json
 
 from .utils_motifs import load_word_vectors
-
+from maskrcnn_benchmark.utils.miscellaneous import bbox_overlaps
 
 #TSNE
 import matplotlib.pyplot as plt
@@ -279,9 +279,10 @@ class ReweightingCE(nn.Module):
     Given a soft label, choose the class with max class as the GT.
     converting label like [0.1, 0.3, 0.6] to [0, 0, 1] and apply CrossEntropy
     """
-    def __init__(self, reduction="mean"):
+    def __init__(self, dataset=None,reduction="mean"):
         super(ReweightingCE, self).__init__()
         self.reduction=reduction
+        self.dataset=dataset
 
     def forward(self, input, target,weights):
         """
@@ -299,9 +300,11 @@ class ReweightingCE(nn.Module):
         # weights[idxs] = -target[:, 0][idxs]
         # target = final_target
         x = F.log_softmax(input, 1)
-        target_onehot = torch.FloatTensor(target.size(0), 51).cuda()
-        #GQA200
-        #target_onehot=torch.FloatTensor(target.size(0),101).cuda()
+        if self.dataset=='VG':
+            target_onehot = torch.FloatTensor(target.size(0), 51).cuda()
+        else:
+            #GQA200
+            target_onehot=torch.FloatTensor(target.size(0),101).cuda()
         target_onehot.zero_()
         target_onehot.scatter_(1,target.view(-1,1),1)
         loss = torch.sum(- x * target_onehot, dim=1)*weights
@@ -315,6 +318,62 @@ class ReweightingCE(nn.Module):
             return torch.mean(loss)
         else:
             raise ValueError('unrecognized option, expect reduction to be one of none, mean, sum')
+
+
+
+class weightedCE(nn.Module):
+    """
+    Given a soft label, choose the class with max class as the GT.
+    converting label like [0.1, 0.3, 0.6] to [0, 0, 1] and apply CrossEntropy
+    """
+    def __init__(self, reduction="mean"):
+        super(weightedCE, self).__init__()
+        self.reduction=reduction
+
+    def forward(self, input1,input2, target,weights,class_num):
+        """
+        Args:
+            input: the prediction
+            target: [N, N_classes]. For each slice [weight, 0, 0, 1, 0, ...]
+                we need to extract weight.
+        Returns:
+
+        """
+        # final_target = torch.zeros_like(target)
+        # final_target[torch.arange(0, target.size(0)), target.argmax(1)] = 1.
+        # idxs = (target[:, 0] != 1).nonzero().squeeze()
+        # weights = torch.ones_like(target[:, 0])
+        # weights[idxs] = -target[:, 0][idxs]
+        # target = final_target
+        x1 = F.log_softmax(input1, 1)
+        x2 = F.log_softmax(input2, 1)
+        #target_onehot = torch.FloatTensor(target.size(0), class_num).cuda()
+        #GQA200
+        target_onehot=torch.FloatTensor(target.size(0),101).cuda()
+        target_onehot.zero_()
+        target_onehot.scatter_(1,target.view(-1,1),1)
+        oriloss1 = torch.sum(- x1 * target_onehot, dim=1)
+        oriloss2 = torch.sum(- x2 * target_onehot, dim=1)
+        delta_loss=0.5*(oriloss1-oriloss2)
+        loss1 = (oriloss1-delta_loss) * (1-weights).squeeze(axis=1)
+        loss2 = (oriloss2+delta_loss)*weights.squeeze(axis=1)
+
+        loss=loss1+loss2
+        #loss = torch.sum(- x * target_onehot, dim=1)
+        #loss=loss*weights
+        if self.reduction == 'none':
+            return loss
+        elif self.reduction == 'sum':
+            return torch.sum(loss)
+        elif self.reduction == 'mean':
+            return torch.mean(loss)
+        else:
+            raise ValueError('unrecognized option, expect reduction to be one of none, mean, sum')
+
+
+
+
+
 
 
 class SoftTriple(nn.Module):
@@ -523,7 +582,7 @@ class PrototypeEmbeddingNetwork(nn.Module):
         self.out_obj = make_fc(self.hidden_dim, self.num_obj_classes)
         self.lin_obj_cyx = make_fc(self.obj_dim + self.embed_dim + 128, self.hidden_dim)
 
-        self.direct_relation = True
+        self.direct_relation = False
         # if self.direct_relation == True:
         self.use_cosdis = True
         if self.use_cosdis == False:
@@ -541,6 +600,19 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         # text_emb
         self.use_emb = True
+        self.iter_2 = 0
+
+        self.iter = 1
+        self.use_causal = True
+        if self.use_causal:
+            self.causal_weight = 1
+            if self.training == True:
+                self.qhat = self.initial_qhat(class_num=self.num_rel_cls)
+
+        self.use_causal_test = False
+        if self.use_causal_test:
+            self.causal_weight_test = 0.5
+
 
         if self.cfg.MODEL.ROI_RELATION_HEAD.USE_GT_BOX:
             if self.cfg.MODEL.ROI_RELATION_HEAD.USE_GT_OBJECT_LABEL:
@@ -549,6 +621,20 @@ class PrototypeEmbeddingNetwork(nn.Module):
                 self.mode = 'sgcls'
         else:
             self.mode = 'sgdet'
+
+    def initial_qhat(self,class_num=1000):
+        # initialize qhat of predictions (probability)
+        qhat = (torch.ones([1, class_num], dtype=torch.float) / class_num).cuda()
+        print("qhat size: ".format(qhat.size()))
+        return qhat
+
+    def update_qhat(self,probs, qhat, momentum, qhat_mask=None):
+        if qhat_mask is not None:
+            mean_prob = probs.detach() * qhat_mask.detach().unsqueeze(dim=-1)
+        else:
+            mean_prob = probs.detach().mean(dim=0)
+        qhat = momentum * qhat + (1 - momentum) * mean_prob
+        return qhat
 
     def fcc(self, feature, label, num_classes, FCC_weight):
         """
@@ -588,6 +674,16 @@ class PrototypeEmbeddingNetwork(nn.Module):
         return new_features
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None):
+
+
+        self.iter_2 += 1
+        if self.iter_2==9:
+            print("*******************************************************************************************")
+            if self.use_causal:
+                print("train_causal",self.causal_weight)
+            if self.use_causal_test:
+                print("test_causal", self.causal_weight_test)
+
 
         add_losses = {}
         add_data = {}
@@ -709,6 +805,26 @@ class PrototypeEmbeddingNetwork(nn.Module):
             fg_labels = cat([proposal.get_field("labels") for proposal in proposals], dim=0)
             rel_labels = cat(rel_labels, dim=0)
 
+            if self.use_causal:
+                self.qhat = self.update_qhat(torch.softmax(relation_logits.detach(), dim=-1), self.qhat,
+                                             momentum=0.99)
+                delta_logits = torch.log(self.qhat)
+                delta_logits[0][0] = torch.max(delta_logits[0][1:])
+                relation_logits = relation_logits + self.causal_weight * delta_logits
+
+                if self.iter == 1:
+                    from maskrcnn_benchmark.utils.miscellaneous import mkdir
+                    mkdir('./PENET_sgdet')
+
+                self.iter += 1
+                if self.iter % 5000 == 0:
+                    print("###################################################")
+                    print("qhat:", self.qhat)
+                    print("rel:", torch.softmax(relation_logits.detach(), dim=-1).mean(dim=0))
+                    # np.savetxt('./PENET_sgdet/qhat_%d.csv' % self.iter,
+                    #            delta_logits.detach().cpu().numpy(), fmt='%f', delimiter=',', footer='\n')
+
+
             add_losses['relation_loss'] = self.criterion_loss(relation_logits, rel_labels.long())
 
 
@@ -740,7 +856,7 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
             ###  Prototype-based Learning  ---- Euclidean distance
             if self.direct_relation == False:
-                rel_labels = cat(rel_labels, dim=0)
+                #rel_labels = cat(rel_labels, dim=0)
                 gamma1 = 1.0
                 rel_rep_expand = rel_rep.unsqueeze(dim=1).expand(-1, 51, -1)  # r
                 predicate_proto_expand = predicate_proto.unsqueeze(dim=0).expand(rel_labels.size(0), -1, -1)  # ci
@@ -761,7 +877,14 @@ class PrototypeEmbeddingNetwork(nn.Module):
             if self.use_protoandce:
                 return entity_dists, rel_dists, add_losses, add_data, rel_dists_ce
             return None, None, add_losses
+        else:
+            if self.use_causal_test:
+                relation_logits = cat(rel_dists, dim=0)
+                delta_logits=np.loadtxt("/yourdatapath/SHA/PENET_sgcls/qhat_60000.csv", delimiter=',')
 
+                delta_logits=torch.Tensor(delta_logits).cuda()
+                rel_dists = relation_logits - self.causal_weight_test * delta_logits
+                rel_dists = rel_dists.split(num_rels, dim=0)
         return entity_dists, rel_dists, add_losses
 
         # return entity_dists, rel_dists_ce, add_losses, add_data
@@ -896,6 +1019,7 @@ class EICR_model(nn.Module):
         self.post_emb = nn.Linear(self.hidden_dim, self.hidden_dim * 2)
         self.post_cat = nn.Linear(self.hidden_dim * 2, self.pooling_dim)
 
+
         self.rel_compress = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
         if self.base_encoder=='VCTree':
             self.ctx_compress = nn.Linear(self.pooling_dim, self.num_rel_cls)
@@ -930,10 +1054,23 @@ class EICR_model(nn.Module):
         self.sample_rate_matrix = generate_sample_rate_vector(config.GLOBAL_SETTING.DATASET_CHOICE, self.max_group_element_number_list)
 
 
+
         #over-env
         self.weight_rate_matrix = generate_weight_rate_vector(config.GLOBAL_SETTING.DATASET_CHOICE,
                                                               self.max_group_element_number_list)
 
+        self.weight_rate_matrix_over = generate_weight_rate_vector_over(config.GLOBAL_SETTING.DATASET_CHOICE,
+                                                              self.max_group_element_number_list)
+
+
+        #########################prior#####################
+        if config.GLOBAL_SETTING.DATASET_CHOICE == 'VG':
+            self.sample_rate = sample_rate_vector(config.GLOBAL_SETTING.DATASET_CHOICE,[50])
+        else:
+            if config.GLOBAL_SETTING.DATASET_CHOICE == 'GQA_200':
+                self.sample_rate = sample_rate_vector(config.GLOBAL_SETTING.DATASET_CHOICE,
+                                                                                [100])
+        #sum_rate=sum(self.sample_rate[0])
 
 
         self.num_groups = len(self.max_elemnt_list)
@@ -946,7 +1083,7 @@ class EICR_model(nn.Module):
 
 
 
-        self.rel_criterion_loss = ReweightingCE()
+        self.rel_criterion_loss = ReweightingCE(dataset=config.GLOBAL_SETTING.DATASET_CHOICE)
         self.criterion_loss = nn.CrossEntropyLoss()
 
 
@@ -964,7 +1101,7 @@ class EICR_model(nn.Module):
         self.iter_2 = 0
         self.max_iter = 120000
 
-        self.adjust_env = True
+        self.adjust_env = False
 
 
         self.dataset_choice=config.GLOBAL_SETTING.DATASET_CHOICE
@@ -976,7 +1113,7 @@ class EICR_model(nn.Module):
         self.only_vision = False
 
         #IRM
-        self.penalty_v1 = False
+        self.penalty_v1 = True
         self.penalty_v2 = False
         self.penalty_v2_weight = 2
 
@@ -984,13 +1121,25 @@ class EICR_model(nn.Module):
 
         #causal_reweight
         self.use_causal= False
-        self.causal_weight = 0.4
-        self.qhat = self.initial_qhat(class_num=51)
-        self.qhat_proto = self.initial_qhat(class_num=51)
+        if self.use_causal:
+            self.causal_weight = 0.7
+            if self.training == True:
+                self.qhat = self.initial_qhat(class_num=self.num_rel_cls)
+                self.qhat_proto = self.initial_qhat(class_num=self.num_rel_cls)
 
+        self.qhat_prior=torch.tensor(self.sample_rate[0])
+
+        np.savetxt('./qhat_prior.csv',
+                   self.qhat_prior.detach().cpu().numpy(), fmt='%f', delimiter=',', footer='\n')
+
+        self.use_causal_test = False
+        if self.use_causal_test:
+            self.causal_weight_test = 0.6
+            if self.training == True and self.use_causal==False:
+                self.qhat = self.initial_qhat(class_num=self.num_rel_cls)
 
         self.useFCC= False
-        self.FCC_weight = 0.75
+        self.FCC_weight = 0.25
 
 
         #addsem
@@ -1110,6 +1259,125 @@ class EICR_model(nn.Module):
                     if self.importance_dic_weight[r][pair] < 0.01:
                         self.importance_dic_weight[r][pair] = 0.01
 
+
+        #NCL
+        self.hcm_N = 5
+        self.NCL = False
+
+        self.multi_net = False
+        if self.multi_net:
+            self.rel_compress_0 = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+            self.rel_compress_1 = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+            self.rel_compress_2 = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+
+
+        #balpoe
+        self.balpoe=False
+        self.balpoe_weight=1
+        # self.balpoe_3cls = True
+        # if self.balpoe_3cls:
+        #     self.rel_compress_0 = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+        #     self.rel_compress_1 = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+        #     self.rel_compress_2 = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+
+
+        #multi-sample
+        if config.GLOBAL_SETTING.DATASET_CHOICE == 'VG':
+            self.sample_rate_matrix_over = generate_sample_rate_vector_over(config.GLOBAL_SETTING.DATASET_CHOICE,[50])
+        else:
+            if config.GLOBAL_SETTING.DATASET_CHOICE == 'GQA_200':
+                self.sample_rate_matrix_over = generate_sample_rate_vector_over(config.GLOBAL_SETTING.DATASET_CHOICE,
+                                                                                [100])
+
+        self.use_mix = False
+
+
+
+
+
+        #foreground
+        self.onlyforeground = False
+
+        self.mixforeground = False
+
+        self.splitforeground = False
+
+
+        #dynamic net
+        self.dynamicnet= False
+        if self.dynamicnet:
+            self.use_ROI_gate = nn.Linear(self.pooling_dim, 1)
+            self.use_ROI_gate_S = nn.Linear(self.pooling_dim, 1)
+            self.use_ROI_gate_O = nn.Linear(self.pooling_dim, 1)
+            self.use_ROI_gate_text = nn.Linear(self.pooling_dim, 1)
+            self.use_ROI_gate_pos = nn.Linear(self.pooling_dim, 1)
+
+
+
+            self.rel_so_classifier = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+            self.rel_so_classifier_S = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+            self.rel_so_classifier_O = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+            self.rel_classifier_pos = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+            self.rel_classifier_text = nn.Linear(self.pooling_dim, self.num_rel_cls, bias=True)
+
+            self.sub_cat = nn.Linear(self.hidden_dim, self.pooling_dim)
+            self.obj_cat = nn.Linear(self.hidden_dim, self.pooling_dim)
+            self.pos_cat = nn.Linear(256, self.pooling_dim)
+            self.text_cat = nn.Linear(400, self.pooling_dim)
+
+
+
+            layer_init(self.sub_cat, xavier=True)
+            layer_init(self.obj_cat, xavier=True)
+            layer_init(self.pos_cat, xavier=True)
+            layer_init(self.text_cat, xavier=True)
+
+            layer_init(self.use_ROI_gate, xavier=True)
+            layer_init(self.use_ROI_gate_S, xavier=True)
+            layer_init(self.use_ROI_gate_O, xavier=True)
+            layer_init(self.use_ROI_gate_text, xavier=True)
+            layer_init(self.use_ROI_gate_pos, xavier=True)
+
+
+            layer_init(self.rel_so_classifier, xavier=True)
+            layer_init(self.rel_so_classifier_S, xavier=True)
+            layer_init(self.rel_so_classifier_O, xavier=True)
+            layer_init(self.rel_classifier_pos, xavier=True)
+            layer_init(self.rel_classifier_text, xavier=True)
+
+
+            self.sigmoid_layer = nn.Sigmoid()
+            self.weightedCE = weightedCE()
+            if self.use_causal==True:
+                if self.training==True:
+                    self.qhat_s = self.initial_qhat(class_num=self.num_rel_cls)
+                    self.qhat_o = self.initial_qhat(class_num=self.num_rel_cls)
+                    self.qhat_pos = self.initial_qhat(class_num=self.num_rel_cls)
+                    self.qhat_text = self.initial_qhat(class_num=self.num_rel_cls)
+
+
+        #nms
+        self.use_nms=False
+
+        self.iter_test = 0
+
+        self.mixup_alpha = 0.4
+
+
+        #background
+        self.choose_background = False
+        self.bgweight = 1.0
+        self.only_forground = False
+
+
+        self.bgmix = False
+        if self.bgmix:
+            self.bgmix_weight = 4.0
+
+        self.sample_forground = False
+        if self.sample_forground:
+            self.sample_forground_rate=0.5
+
         aaaaaa=0
 
 
@@ -1194,6 +1462,125 @@ class EICR_model(nn.Module):
         return new_features
 
 
+    #balpoe
+    def get_default_bias(self, tau=1):
+        self.eps=1e-09
+
+        self.bsce_weight = torch.tensor([3024465, 109355, 67144, 47326, 31347, 21748, 15300, 10011, 11059, 10764, 6712,
+                                         5086, 4810, 3757, 4260, 3167, 2273, 1829, 1603, 1413, 1225, 793, 809, 676, 352,
+                                         663, 752, 565, 504, 644, 601, 551, 460, 394, 379, 397, 429, 364, 333, 299, 270,
+                                         234, 171, 208, 163, 157, 151, 71, 114, 44, 4])
+
+
+        prior = self.bsce_weight.cuda()
+        prior =torch.true_divide(prior,prior.sum())
+        log_prior = torch.log(prior + self.eps)
+        return tau * log_prior
+
+    def get_bias_from_index(self, e_idx):
+        self.tau_list = (0, 1, 2)
+        tau = self.tau_list[e_idx]
+        return self.get_default_bias(tau)
+
+
+    def rel_nms(self,pred_boxes, gt_labels, pred_rel_inds, rel_scores, nms_thresh=0.5):
+        # rel_scores N*50——交集面积除以并集面积
+
+        if len(pred_rel_inds) == 1:
+            return gt_labels
+        pred_classes = pred_boxes.get_field("labels")
+        pred_boxes=pred_boxes.bbox
+        ious = bbox_overlaps(pred_boxes, pred_boxes)  # rel_scores N*N-N 所有可能的pair的logit
+        pred_rel_inds=pred_rel_inds.cpu()
+        #print(pred_rel_inds)
+        sub_ious = ious[pred_rel_inds[:, 0]][:, pred_rel_inds[:, 0]]  # pred_rel_inds N*N-N 所有可能的pair
+        obj_ious = ious[pred_rel_inds[:, 1]][:, pred_rel_inds[:, 1]]
+        rel_ious = np.minimum(sub_ious, obj_ious)  # 取关系中相对较小的IOU
+        sub_labels = pred_classes[pred_rel_inds[:, 0]].cpu().numpy()
+        obj_labels = pred_classes[pred_rel_inds[:, 1]].cpu().numpy()
+        aaaaaaa = rel_scores[:, None, :]
+        bbbbbbbbb = rel_scores[None, :, :]
+        # N*N-N 1 C 和 1 N*N-N C;isoverlap:SO相同，IOU高，但predlogits不一样
+
+        is_overlap = (rel_ious >= nms_thresh) & (sub_labels[:, None] == sub_labels[None, :]) & (
+                    obj_labels[:, None] == obj_labels[None, :])
+        #is_overlap = is_overlap[:, :, None].repeat(rel_scores.shape[1], axis=2)
+
+        rel_scores_cp = rel_scores.cpu().numpy().copy()
+        rel_scores_cp[:, 0] = 0.0 # 背景logits置为0
+        pred_rels = np.zeros(rel_scores_cp.shape[0], dtype=np.int64)
+        overlap_flag = np.zeros(rel_scores_cp.shape[0], dtype=np.int64)
+
+        fore_flag = np.zeros(rel_scores_cp.shape[0], dtype=np.int64)
+
+        # for i in range(rel_scores_cp.shape[0]):
+        #     box_ind, cls_ind = np.unravel_index(rel_scores_cp.argmax(), rel_scores_cp.shape)
+        #     if float(pred_rels[int(box_ind)]) > 0:  # 三元组已标，跳过
+        #         pass
+        #     else:
+        #         if gt_labels[int(box_ind)] == 0:
+        #             pred_rels[int(box_ind)] = gt_labels[int(box_ind)]
+        #         else:
+        #             if overlap_flag[int(box_ind)]==0:
+        #                 pred_rels[int(box_ind)] = gt_labels[int(box_ind)]
+        #             else:
+        #                 pred_rels[int(box_ind)] = int(cls_ind)  # 取最大logit对应为pred
+        #     rel_scores_cp[is_overlap[box_ind, :, cls_ind], cls_ind] = 0.0
+        #     overlap_flag[is_overlap[box_ind, :, cls_ind]] = 1
+        #     rel_scores_cp[box_ind] = -1.
+
+        for r in range(rel_scores_cp.shape[0]):
+            if gt_labels[r]>0:
+                fore_flag[is_overlap[r, :, ]] = 1
+
+        for i in range(rel_scores_cp.shape[0]):
+            if float(pred_rels[i]) > 0:  # 三元组已标，跳过
+                pass
+            cls_ind = rel_scores_cp[i].argmax()
+
+
+            # if gt_labels[i] == 0:
+            #     pred_rels[i] = 0
+            # else:
+            #     if overlap_flag[i]==0:
+            #         pred_rels[i] = gt_labels[i]
+            #     else:
+            #         overlap_labels = np.where(rel_scores_cp[i] == 0.0)[0]
+            #         if int(gt_labels[i]) not in overlap_labels:
+            #             pred_rels[i] = int(gt_labels[i])
+            #         else:
+            #             fin_label=cls_ind
+            #             relscores_adjust=rel_scores_cp[i].copy()
+            #             while int(fin_label) in overlap_labels:
+            #                 relscores_adjust[int(fin_label)]=0.0
+            #                 fin_label = relscores_adjust.argmax()
+            #             pred_rels[i]=fin_label
+
+
+            if gt_labels[i] == 0:
+                pred_rels[i] = 0
+            else:
+                if overlap_flag[i]==0:
+                    pred_rels[i] = gt_labels[i]
+                else:
+                    overlap_labels = np.where(rel_scores_cp[i] == 0.0)[0]
+                    if int(gt_labels[i]) not in overlap_labels:
+                        pred_rels[i] = int(gt_labels[i])
+                    else:
+                        fin_label=cls_ind
+                        relscores_adjust=rel_scores_cp[i].copy()
+                        while int(fin_label) in overlap_labels:
+                            relscores_adjust[int(fin_label)]=0.0
+                            fin_label = relscores_adjust.argmax()
+                        pred_rels[i]=fin_label
+
+
+            rel_scores_cp[is_overlap[i, :, ], pred_rels[i]] = 0.0
+
+            overlap_flag[is_overlap[i, :, ]] = 1
+            rel_scores_cp[i] = -1.
+
+        return torch.tensor(pred_rels).cuda()
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None):
         """
@@ -1203,10 +1590,30 @@ class EICR_model(nn.Module):
             rel_pair_idxs (list[Tensor]): (num_rel, 2) index of subject and object
             union_features (Tensor): (batch_num_rel, context_pooling_dim): visual union feature of each pair
         """
+        ####ROI特征——通过特征图pooling得到
+
+
+
+
 
         self.iter_2 += 1
-        if self.iter_2==99:
+        if self.iter_2==9:
             print("*******************************************************************************************")
+            if self.use_causal:
+                print("train_causal",self.causal_weight)
+            if self.use_causal_test:
+                print("test_causal", self.causal_weight_test)
+            if self.choose_background:
+                if self.only_forground:
+                    print("########################only use forground samples#####################")
+                print("bgweight", self.bgweight)
+            if self.bgmix:
+                print("alpha", self.mixup_alpha)
+                print("bgmix-weight", self.bgmix_weight)
+            if self.sample_forground:
+                print("sample_forground:",self.sample_forground_rate)
+
+
 
         # reweight
         if self.adjust_env:
@@ -1229,35 +1636,27 @@ class EICR_model(nn.Module):
             self.overweighted_weight_p=1-alpha
 
 
-        #trans
-
-
-
-###################################################################################################
-
-##################################################################################
-
-
-        #######################
-
-
-
-
-
-
-
-        ############
-
-
 
         if self.base_encoder == 'Motifs':
-            obj_dists, obj_preds, edge_ctx, _ = self.context_layer(roi_features, proposals, logger)
+            if self.dynamicnet==True:
+                obj_dists, obj_preds, edge_ctx, pos_emb,text_emb = self.context_layer(roi_features, proposals, logger,return_pos=True)
+            else:
+                obj_dists, obj_preds, edge_ctx, _ = self.context_layer(roi_features, proposals, logger)
         else:
             if self.base_encoder == 'Self-Attention':
-                obj_dists, obj_preds, edge_ctx= self.context_layer(roi_features, proposals, logger)
+                if self.dynamicnet == True:
+                    obj_dists, obj_preds, edge_ctx, pos_emb, text_emb = self.context_layer(roi_features,proposals,
+                                                                                                         logger,
+                                                                                                         return_pos=True)
+                else:
+                    obj_dists, obj_preds, edge_ctx= self.context_layer(roi_features, proposals, logger)
             else:
                 if self.base_encoder == 'VCTree':
-                    obj_dists, obj_preds, edge_ctx, binary_preds = self.context_layer(roi_features, proposals,
+                    if self.dynamicnet == True:
+                        obj_dists, obj_preds, edge_ctx,binary_preds,pos_emb, text_emb = self.context_layer(roi_features, proposals,
+                                                                                               logger, return_pos=True)
+                    else:
+                        obj_dists, obj_preds, edge_ctx, binary_preds = self.context_layer(roi_features, proposals,
                                                                                       rel_pair_idxs, logger)
 
         # post decode
@@ -1278,7 +1677,11 @@ class EICR_model(nn.Module):
         tail_reps = tail_rep.split(num_objs, dim=0)
         obj_preds = obj_preds.split(num_objs, dim=0)
 
-        if self.addsem:
+        if self.dynamicnet==True:
+            pos_embs = pos_emb.split(num_objs, dim=0)
+            text_embs = text_emb.split(num_objs, dim=0)
+
+        if self.addsem==True:
             sem_head = self.vis2sem(head_rep)
             sem_tail = self.vis2sem(tail_rep)
             sem_head = self.norm_sub(self.dropout_sub(torch.relu(self.linear_sub(sem_head))) + sem_head)
@@ -1302,14 +1705,41 @@ class EICR_model(nn.Module):
             rel_rep = self.post_cat_sem(self.dropout_rel(torch.relu(rel_rep)))
             predicate_proto = self.post_cat_sem(self.dropout_pred(torch.relu(predicate_proto)))
 
-
         prod_reps = []
         pair_preds = []
-        for pair_idx, head_rep, tail_rep, obj_pred in zip(rel_pair_idxs, head_reps, tail_reps, obj_preds):
-            prod_reps.append(torch.cat((head_rep[pair_idx[:, 0]], tail_rep[pair_idx[:, 1]]), dim=-1))
-            pair_preds.append(torch.stack((obj_pred[pair_idx[:, 0]], obj_pred[pair_idx[:, 1]]), dim=1))
+
+        if self.dynamicnet==True:
+            sub_reps = []
+            obj_reps = []
+
+            pos_feats=[]
+            text_feats=[]
+
+
+        if self.dynamicnet == True:
+            for pair_idx, head_rep, tail_rep, obj_pred,pos_f,text_f in zip(rel_pair_idxs, head_reps, tail_reps, obj_preds,pos_embs,text_embs):
+                prod_reps.append(torch.cat((head_rep[pair_idx[:, 0]], tail_rep[pair_idx[:, 1]]), dim=-1))
+                pair_preds.append(torch.stack((obj_pred[pair_idx[:, 0]], obj_pred[pair_idx[:, 1]]), dim=1))
+
+                pos_feats.append(torch.cat((pos_f[pair_idx[:, 0]], pos_f[pair_idx[:, 1]]), dim=-1))
+                text_feats.append(torch.cat((text_f[pair_idx[:, 0]], text_f[pair_idx[:, 1]]), dim=-1))
+
+                sub_reps.append(head_rep[pair_idx[:, 0]])
+                obj_reps.append(tail_rep[pair_idx[:, 1]])
+        else:
+            for pair_idx, head_rep, tail_rep, obj_pred in zip(rel_pair_idxs, head_reps, tail_reps, obj_preds):
+                prod_reps.append(torch.cat((head_rep[pair_idx[:, 0]], tail_rep[pair_idx[:, 1]]), dim=-1))
+                pair_preds.append(torch.stack((obj_pred[pair_idx[:, 0]], obj_pred[pair_idx[:, 1]]), dim=1))
+
         prod_rep = cat(prod_reps, dim=0)
         pair_pred = cat(pair_preds, dim=0)
+        if self.dynamicnet==True:
+            sub_rep = cat(sub_reps, dim=0)
+            obj_rep = cat(obj_reps, dim=0)
+        #
+            pos_feat = cat(pos_feats, dim=0)
+            text_feat = cat(text_feats, dim=0)
+
 
         if self.base_encoder == 'Self-Attention':
             ctx_gate = self.post_cat(prod_rep)
@@ -1328,9 +1758,29 @@ class EICR_model(nn.Module):
                     prod_rep = prod_rep - union_features * gate_pred
                 else:
                     if self.base_encoder=='Self-Attention':
-                        visual_rep = ctx_gate * union_features
+                        if self.dynamicnet==True:
+                            S_feat = self.sub_cat(sub_rep)
+                            O_feat = self.obj_cat(obj_rep)
+                            #
+                            text_union = self.text_cat(text_feat)
+                            pos_union = self.pos_cat(pos_feat)
+
+                            SO_feat = ctx_gate
+                            union_feat = ctx_gate * union_features
+                        else:
+                            visual_rep = ctx_gate * union_features
                     else:
-                        prod_rep = prod_rep * union_features
+                        if self.dynamicnet==True:
+                            S_feat = self.sub_cat(sub_rep)
+                            O_feat = self.obj_cat(obj_rep)
+                            #
+                            text_union = self.text_cat(text_feat)
+                            pos_union = self.pos_cat(pos_feat)
+
+                            SO_feat = prod_rep
+                            union_feat = prod_rep * union_features
+                        else:
+                            prod_rep = prod_rep * union_features
 
         if self.only_vision:
             prod_rep = union_features
@@ -1340,10 +1790,6 @@ class EICR_model(nn.Module):
 
 
         if self.training:
-
-
-            # 3samples
-
 
 
 
@@ -1362,14 +1808,27 @@ class EICR_model(nn.Module):
                 fg_labels = cat([proposal.get_field("labels") for proposal in proposals], dim=0)
                 loss_refine_obj = self.criterion_loss(obj_dists, fg_labels.long())
                 add_losses['obj_loss'] = loss_refine_obj
+            rel_lenth = []
+            for i in range(len(rel_labels)):
+                rel_lenth.append(len(rel_labels[i]))
             rel_labels = cat(rel_labels, dim=0)
+
             max_label = max(rel_labels)
 
+            # 3samples
             if self.use3env:
                 num_groups=3
                 cur_chosen_matrix = []
+                cur_chosen_matrix_foreground = []
+                cur_chosen_matrix_background = []
+
+                allforeground=[]
+                foregroundcount=[]
                 for i in range(num_groups):
                     cur_chosen_matrix.append([])
+                    cur_chosen_matrix_foreground.append([])
+                    cur_chosen_matrix_background.append([])
+                    foregroundcount.append(0)
 
                 if self.intra_class:
 
@@ -1405,26 +1864,51 @@ class EICR_model(nn.Module):
                         if rel_tar == 0:
                             random_idx = random.randint(0, num_groups - 1)
                             cur_chosen_matrix[random_idx].append(i)
+                            cur_chosen_matrix_background[random_idx].append(i)
+
+                            ############all bg
+                            # aaaa=1
+                            # cur_chosen_matrix[0].append(i)
+                            # cur_chosen_matrix[1].append(i)
+                            # cur_chosen_matrix[2].append(i)
+
+                            # if len(cur_chosen_matrix[0])==0:############保证有样本
+                            #     cur_chosen_matrix[0].append(i)
+                            # if len(cur_chosen_matrix[1])==0:############保证有样本
+                            #     cur_chosen_matrix[1].append(i)
+                            # if len(cur_chosen_matrix[2])==0:############保证有样本
+                            #     cur_chosen_matrix[2].append(i)
+
                         else:
                             random_num = random.random()
+                            allforeground.append(i)
                             for j in range(num_groups):
+                                ##############sample不变##################
+                                # if random_num<=0.5:
+                                #     cur_chosen_matrix[j].append(i)
+                                #     cur_chosen_matrix_foreground[j].append(i)
+                                ################################
+
                                 if j==0:
                                     if random_num<=0.5:
                                         cur_chosen_matrix[j].append(i)
+                                        cur_chosen_matrix_foreground[j].append(i)
+
                                 else:
+                                    # multi-sample
+                                    # if j == 1:
                                     if random_num<=self.sample_rate_matrix[-1][rel_tar]:
-                                        cur_chosen_matrix[j].append(i)
+                                            cur_chosen_matrix[j].append(i)
+                                            cur_chosen_matrix_foreground[j].append(i)
 
-                ##########################
+                                    # multi-sample
+                                    # else:
+                                    #     if random_num<=self.sample_rate_matrix_over[0][rel_tar]:
+                                    #             cur_chosen_matrix[j].append(i)
+                                    #             cur_chosen_matrix_foreground[j].append(i)
 
-                #############
-
-
-
-
-
-
-
+                for i in range(num_groups):
+                    foregroundcount[i]=len(cur_chosen_matrix_foreground[i])
 
 
                 for i in range(num_groups):
@@ -1433,22 +1917,85 @@ class EICR_model(nn.Module):
                             break
 
                     if max_label == 0:
-                        if self.base_encoder == 'Self-Attention':
-                            group_visual = visual_rep
+                        if self.dynamicnet:
+                            group_input_union = union_feat
+                            group_input_SO = SO_feat
 
-                        group_input = prod_rep
-                        group_label = rel_labels
-                        group_pairs = pair_pred
+                            group_input_S = S_feat
+                            group_input_O = O_feat
+                            #
+                            group_input_text = text_union
+                            group_input_pos = pos_union
+
+                            group_input = prod_rep
+                            group_label = rel_labels
+                            group_pairs = pair_pred
+                        else:
+                            if self.base_encoder == 'Self-Attention':
+                                group_visual = visual_rep
+
+                            group_input = prod_rep
+                            group_label = rel_labels
+                            group_pairs = pair_pred
                     else:
-                        if self.base_encoder == 'Self-Attention':
-                            group_visual = visual_rep[cur_chosen_matrix[i]]
+                        if self.dynamicnet:
+                            group_input_union = union_feat[cur_chosen_matrix[i]]
+                            group_input_SO = SO_feat[cur_chosen_matrix[i]]
 
-                        group_input = prod_rep[cur_chosen_matrix[i]]
-                        group_label = rel_labels[cur_chosen_matrix[i]]
-                        group_pairs = pair_pred[cur_chosen_matrix[i]]
+
+                            group_input_S = S_feat[cur_chosen_matrix[i]]
+                            group_input_O = O_feat[cur_chosen_matrix[i]]
+                            #
+                            group_input_text = text_union[cur_chosen_matrix[i]]
+                            group_input_pos = pos_union[cur_chosen_matrix[i]]
+
+                            group_label = rel_labels[cur_chosen_matrix[i]]
+                            group_pairs = pair_pred[cur_chosen_matrix[i]]
+
+                            group_input = prod_rep[cur_chosen_matrix[i]]
+                        else:
+                            if self.base_encoder == 'Self-Attention':
+                                group_visual = visual_rep[cur_chosen_matrix[i]]
+
+                            group_input = prod_rep[cur_chosen_matrix[i]]
+                            group_label = rel_labels[cur_chosen_matrix[i]]
+                            group_pairs = pair_pred[cur_chosen_matrix[i]]
+
+
+
+                        if self.onlyforeground==True or self.mixforeground==True or self.splitforeground==True:
+                            foreground_input = prod_rep[cur_chosen_matrix_foreground[i]]
+                            foreground_label = rel_labels[cur_chosen_matrix_foreground[i]]
+                            foreground_pairs = pair_pred[cur_chosen_matrix_foreground[i]]
+
+                            background_input = prod_rep[cur_chosen_matrix_background[i]]
+                            background_label = rel_labels[cur_chosen_matrix_background[i]]
+                            background_pairs = pair_pred[cur_chosen_matrix_background[i]]
 
                         '''count Cross Entropy loss'''
                     jdx = i
+
+
+                    ############mixup###############
+                    if i == 2:
+                        if self.use_mix==True:
+                            self.mixup_alpha=0.4
+                            if self.onlyforeground == True or self.mixforeground==True:
+                                lambda_ = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+                                idx = torch.randperm(foreground_input.size(0))  # random打乱
+                                input_a, input_b = foreground_input, foreground_input[idx]
+                                label_a, label_b = foreground_label, foreground_label[idx]
+                                pair_a, pair_b = foreground_pairs, foreground_pairs[idx]
+                                mixed_input = lambda_ * input_a + (1 - lambda_) * input_b
+                            else:
+                                lambda_ = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+                                idx = torch.randperm(group_input.size(0))  # random打乱
+                                input_a, input_b = group_input, group_input[idx]
+                                label_a, label_b = group_label, group_label[idx]
+                                pair_a, pair_b = group_pairs, group_pairs[idx]
+                                mixed_input = lambda_ * input_a + (1 - lambda_) * input_b
+
+
                     if self.addproto:
                         # proto
                         predicate_proto = self.W_pred(self.rel_embed.weight)
@@ -1462,80 +2009,593 @@ class EICR_model(nn.Module):
                         group_output_now_proto = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()
 
                     if self.base_encoder == 'Self-Attention':
-                        group_output_now = self.rel_compress(group_visual) + self.ctx_compress(group_input)
+                        if self.dynamicnet:
+                            group_output_now_union = self.rel_compress(group_input_union) + self.ctx_compress(group_input)
+                            group_output_now_so = self.rel_so_classifier(group_input_SO)
+
+                            group_output_now_s = self.rel_so_classifier_S(group_input_S)
+                            group_output_now_o = self.rel_so_classifier_O(group_input_O)
+
+                            group_output_now_text = self.rel_classifier_text(group_input_text)
+                            group_output_now_pos = self.rel_classifier_pos(group_input_pos)
+
+                            self.dynamicgate = self.use_ROI_gate(group_input_union)
+                            self.dynamicgate = self.sigmoid_layer(self.dynamicgate)
+
+                            self.dynamicgate_S = self.use_ROI_gate_S(group_input_union)
+                            self.dynamicgate_S = self.sigmoid_layer(self.dynamicgate_S)
+                            self.dynamicgate_O = self.use_ROI_gate_O(group_input_union)
+                            self.dynamicgate_O = self.sigmoid_layer(self.dynamicgate_O)
+                            #
+                            self.dynamicgate_pos = self.use_ROI_gate_pos(group_input_union)
+                            self.dynamicgate_pos = self.sigmoid_layer(self.dynamicgate_pos)
+                            self.dynamicgate_text = self.use_ROI_gate_text(group_input_union)
+                            self.dynamicgate_text = self.sigmoid_layer(self.dynamicgate_text)
+                        else:
+                            group_output_now = self.rel_compress(group_visual) + self.ctx_compress(group_input)
                     else:
-                        group_output_now= self.rel_compress(group_input)
+                        if i == 2:
+                            if self.splitforeground == True:
+                                if self.base_encoder == 'VCTree':
+                                    group_output_foreground = self.ctx_compress(foreground_input)
+                                    group_output_background = self.ctx_compress(background_input)
+                                else:
+                                    group_output_foreground = self.rel_compress(foreground_input)
+                                    group_output_background = self.rel_compress(background_input)
+                            else:
+                                if self.base_encoder == 'VCTree':
+                                    if self.dynamicnet:
+                                        group_output_now_union = self.ctx_compress(group_input_union)
+                                        group_output_now_so = self.rel_so_classifier(group_input_SO)
+
+                                        group_output_now_s = self.rel_so_classifier_S(group_input_S)
+                                        group_output_now_o = self.rel_so_classifier_O(group_input_O)
+
+                                        group_output_now_text = self.rel_classifier_text(group_input_text)
+                                        group_output_now_pos = self.rel_classifier_pos(group_input_pos)
+
+
+
+                                        self.dynamicgate = self.use_ROI_gate(group_input_union)
+                                        self.dynamicgate = self.sigmoid_layer(self.dynamicgate)
+
+
+                                        self.dynamicgate_S = self.use_ROI_gate_S(group_input_union)
+                                        self.dynamicgate_S = self.sigmoid_layer(self.dynamicgate_S)
+                                        self.dynamicgate_O = self.use_ROI_gate_O(group_input_union)
+                                        self.dynamicgate_O = self.sigmoid_layer(self.dynamicgate_O)
+                                        #
+                                        self.dynamicgate_pos = self.use_ROI_gate_pos(group_input_union)
+                                        self.dynamicgate_pos = self.sigmoid_layer(self.dynamicgate_pos)
+                                        self.dynamicgate_text = self.use_ROI_gate_text(group_input_union)
+                                        self.dynamicgate_text = self.sigmoid_layer(self.dynamicgate_text)
+                                    else:
+                                        group_output_now = self.ctx_compress(group_input)
+                                else:
+                                    if self.dynamicnet:
+                                        group_output_now_union = self.rel_compress(group_input_union)
+                                        group_output_now_so = self.rel_so_classifier(group_input_SO)
+
+                                        group_output_now_s = self.rel_so_classifier_S(group_input_S)
+                                        group_output_now_o = self.rel_so_classifier_O(group_input_O)
+
+                                        group_output_now_text = self.rel_classifier_text(group_input_text)
+                                        group_output_now_pos = self.rel_classifier_pos(group_input_pos)
+
+
+
+                                        self.dynamicgate = self.use_ROI_gate(group_input_union)
+                                        self.dynamicgate = self.sigmoid_layer(self.dynamicgate)
+
+
+                                        self.dynamicgate_S = self.use_ROI_gate_S(group_input_union)
+                                        self.dynamicgate_S = self.sigmoid_layer(self.dynamicgate_S)
+                                        self.dynamicgate_O = self.use_ROI_gate_O(group_input_union)
+                                        self.dynamicgate_O = self.sigmoid_layer(self.dynamicgate_O)
+                                        #
+                                        self.dynamicgate_pos = self.use_ROI_gate_pos(group_input_union)
+                                        self.dynamicgate_pos = self.sigmoid_layer(self.dynamicgate_pos)
+                                        self.dynamicgate_text = self.use_ROI_gate_text(group_input_union)
+                                        self.dynamicgate_text = self.sigmoid_layer(self.dynamicgate_text)
+
+                                    else:
+                                        group_output_now = self.rel_compress(group_input)
+                        else:
+                        # mixup
+                        # if i == 2:
+                        #     if self.use_mix == True:
+                        #         if self.onlyforeground==True or self.mixforeground==True:
+                        #             group_output_foreground = self.rel_compress(foreground_input)
+                        #             group_output_foreground_mix = self.rel_compress(mixed_input)
+                        #             group_output_background = self.rel_compress(background_input)
+                        #             group_output_now = self.rel_compress(group_input)
+                        #         else:
+                        #             group_output_now = self.rel_compress(mixed_input)
+                        #     else:
+                        #         group_output_now = self.rel_compress(group_input)
+                        # else:
+                            if self.base_encoder == 'VCTree':
+                                if self.dynamicnet==True:
+                                    group_output_now_union = self.ctx_compress(group_input_union)
+                                    group_output_now_so = self.rel_so_classifier(group_input_SO)
+                                    group_output_now_s = self.rel_so_classifier_S(group_input_S)
+                                    group_output_now_o = self.rel_so_classifier_O(group_input_O)
+
+
+                                    group_output_now_text = self.rel_classifier_text(group_input_text)
+                                    group_output_now_pos = self.rel_classifier_pos(group_input_pos)
+
+
+                                    self.dynamicgate = self.use_ROI_gate(group_input_union)
+                                    self.dynamicgate = self.sigmoid_layer(self.dynamicgate)
+
+                                    self.dynamicgate_S = self.use_ROI_gate_S(group_input_union)
+                                    self.dynamicgate_S = self.sigmoid_layer(self.dynamicgate_S)
+                                    self.dynamicgate_O = self.use_ROI_gate_O(group_input_union)
+                                    self.dynamicgate_O = self.sigmoid_layer(self.dynamicgate_O)
+                                    #
+                                    #
+                                    self.dynamicgate_pos = self.use_ROI_gate_pos(group_input_union)
+                                    self.dynamicgate_pos = self.sigmoid_layer(self.dynamicgate_pos)
+                                    self.dynamicgate_text = self.use_ROI_gate_text(group_input_union)
+                                    self.dynamicgate_text = self.sigmoid_layer(self.dynamicgate_text)
+                                else:
+                                    group_output_now= self.ctx_compress(group_input)
+                            else:
+                                if self.dynamicnet==True:
+                                    group_output_now_union = self.rel_compress(group_input_union)
+                                    group_output_now_so = self.rel_so_classifier(group_input_SO)
+                                    group_output_now_s = self.rel_so_classifier_S(group_input_S)
+                                    group_output_now_o = self.rel_so_classifier_O(group_input_O)
+
+
+                                    group_output_now_text = self.rel_classifier_text(group_input_text)
+                                    group_output_now_pos = self.rel_classifier_pos(group_input_pos)
+
+
+                                    self.dynamicgate = self.use_ROI_gate(group_input_union)
+                                    self.dynamicgate = self.sigmoid_layer(self.dynamicgate)
+
+                                    self.dynamicgate_S = self.use_ROI_gate_S(group_input_union)
+                                    self.dynamicgate_S = self.sigmoid_layer(self.dynamicgate_S)
+                                    self.dynamicgate_O = self.use_ROI_gate_O(group_input_union)
+                                    self.dynamicgate_O = self.sigmoid_layer(self.dynamicgate_O)
+                                    #
+                                    #
+                                    self.dynamicgate_pos = self.use_ROI_gate_pos(group_input_union)
+                                    self.dynamicgate_pos = self.sigmoid_layer(self.dynamicgate_pos)
+                                    self.dynamicgate_text = self.use_ROI_gate_text(group_input_union)
+                                    self.dynamicgate_text = self.sigmoid_layer(self.dynamicgate_text)
+                                else:
+                                    group_output_now= self.rel_compress(group_input)
+
+
                     if self.use_bias:
                         if self.addproto:
                             group_output_now_proto = group_output_now_proto + self.freq_bias.index_with_labels(group_pairs.long())
                         else:
-                            group_output_now = group_output_now + self.freq_bias.index_with_labels(group_pairs.long())
+                            # mixup
+                            # if i == 2:
+                            #     if self.use_mix == True:
+                            #         if self.onlyforeground == True or self.mixforeground== True:
+                            #             group_output_foreground_mix = group_output_foreground_mix + lambda_*self.freq_bias.index_with_labels(
+                            #                 pair_a.long()) +(1-lambda_)*self.freq_bias.index_with_labels(
+                            #                 pair_b.long())
+                            #             group_output_foreground = group_output_foreground + self.freq_bias.index_with_labels(
+                            #                 foreground_pairs.long())
+                            #             group_output_background = group_output_background + self.freq_bias.index_with_labels(
+                            #                 background_pairs.long())
+                            #             group_output_now = group_output_now + self.freq_bias.index_with_labels(
+                            #                 group_pairs.long())
+                            #         else:
+                            #             group_output_now = group_output_now + lambda_*self.freq_bias.index_with_labels(
+                            #                 pair_a.long()) +(1-lambda_)*self.freq_bias.index_with_labels(
+                            #                 pair_b.long())
+                            #     else:
+                            #         group_output_now = group_output_now + self.freq_bias.index_with_labels(
+                            #             group_pairs.long())
+                            # else:
+                            if i == 2:
+                                if self.splitforeground == True:
+                                    group_output_foreground = group_output_foreground+self.freq_bias.index_with_labels(foreground_pairs.long())
+                                    group_output_background = group_output_background+self.freq_bias.index_with_labels(background_pairs.long())
+                                else:
+                                    if self.dynamicnet==True:
+                                        group_output_now_union = group_output_now_union + self.freq_bias.index_with_labels(
+                                            group_pairs.long())
+                                        group_output_now_so = group_output_now_so + self.freq_bias.index_with_labels(
+                                            group_pairs.long())
+
+                                        group_output_now_s = group_output_now_s + self.freq_bias.index_with_labels(
+                                            group_pairs.long())
+                                        group_output_now_o = group_output_now_o + self.freq_bias.index_with_labels(
+                                            group_pairs.long())
+                                        #
+                                        group_output_now_text = group_output_now_text + self.freq_bias.index_with_labels(
+                                            group_pairs.long())
+                                        group_output_now_pos = group_output_now_pos + self.freq_bias.index_with_labels(
+                                            group_pairs.long())
+                                    else:
+                                        group_output_now = group_output_now + self.freq_bias.index_with_labels(
+                                            group_pairs.long())
+                            else:
+                                if self.dynamicnet==True:
+                                    group_output_now_union = group_output_now_union + self.freq_bias.index_with_labels(
+                                        group_pairs.long())
+                                    group_output_now_so = group_output_now_so + self.freq_bias.index_with_labels(
+                                        group_pairs.long())
+
+                                    group_output_now_s = group_output_now_s + self.freq_bias.index_with_labels(
+                                        group_pairs.long())
+                                    group_output_now_o = group_output_now_o + self.freq_bias.index_with_labels(
+                                        group_pairs.long())
+                                    #
+                                    group_output_now_text = group_output_now_text + self.freq_bias.index_with_labels(
+                                        group_pairs.long())
+                                    group_output_now_pos = group_output_now_pos + self.freq_bias.index_with_labels(
+                                        group_pairs.long())
+
+                                else:
+                                    group_output_now = group_output_now + self.freq_bias.index_with_labels(group_pairs.long())
 
 
 
                     if self.useFCC:
-                        group_output_now= self.fcc(group_output_now, group_label, 51 ,self.FCC_weight)
+                        group_output_now= self.fcc(group_output_now, group_label, 51,self.FCC_weight)
+
+
                     if self.use_causal:
+                        if self.dynamicnet:
+                            self.qhat = self.update_qhat(torch.softmax(group_output_now_union.detach(), dim=-1), self.qhat,
+                                                         momentum=0.99)
+                            delta_logits = torch.log(self.qhat)
+                            group_output_now_union = group_output_now_union + self.causal_weight * delta_logits
+
+                            self.qhat_s = self.update_qhat(torch.softmax(group_output_now_s.detach(), dim=-1), self.qhat_s,
+                                                         momentum=0.99)
+                            delta_logits_s = torch.log(self.qhat_s)
+                            group_output_now_s = group_output_now_s + self.causal_weight * delta_logits_s
+
+                            self.qhat_o = self.update_qhat(torch.softmax(group_output_now_o.detach(), dim=-1), self.qhat_o,
+                                                         momentum=0.99)
+                            delta_logits_o = torch.log(self.qhat_o)
+                            group_output_now_o = group_output_now_o + self.causal_weight * delta_logits_o
+
+                            self.qhat_pos = self.update_qhat(torch.softmax(group_output_now_pos.detach(), dim=-1), self.qhat_pos,
+                                                         momentum=0.99)
+                            delta_logits_pos = torch.log(self.qhat_pos)
+                            group_output_now_pos = group_output_now_pos + self.causal_weight * delta_logits_pos
+
+                            self.qhat_text = self.update_qhat(torch.softmax(group_output_now_text.detach(), dim=-1), self.qhat_text,
+                                                         momentum=0.99)
+                            delta_logits_text = torch.log(self.qhat_text)
+                            group_output_now_text = group_output_now_text + self.causal_weight * delta_logits_text
+
+                        else:
                             self.qhat = self.update_qhat(torch.softmax(group_output_now.detach(), dim=-1), self.qhat,
                                                          momentum=0.99)
                             delta_logits = torch.log(self.qhat)
+                            delta_logits[0][0] = torch.max(delta_logits[0][1:])
                             group_output_now = group_output_now + self.causal_weight * delta_logits
 
 
+                    if self.use_causal_test:
+                        self.qhat = self.update_qhat(torch.softmax(group_output_now.detach(), dim=-1), self.qhat,
+                                                     momentum=0.99)
+                        delta_logits = torch.log(self.qhat)
+
+                        if self.iter_2 == 1:
+                            from maskrcnn_benchmark.utils.miscellaneous import mkdir
+                            mkdir('./GQA_EIL_motifs_sgcls')
+                        if self.iter_2 % 5000 == 0:
+                            print("###################################################")
+                            print("qhat:", delta_logits)
+
+                            np.savetxt('./GQA_EIL_motifs_sgcls/qhat_%d.csv' % self.iter_2,
+                                       delta_logits.detach().cpu().numpy(), fmt='%f', delimiter=',', footer='\n')
 
 
+
+
+                    ###############################compute loss##############################################
                     if i==2:
-                        weights = torch.ones_like(group_label,dtype=torch.float16)
+                        # weights = torch.ones_like(group_label,dtype=torch.float16)
+                    #################################over-environment#######################################
 
-                        if self.intra_class:
-                                for i in range(len(group_label)):
-                                    rel_tar = group_label[i].item()
-                                    sub_class = group_pairs[i][0].item()
-                                    obj_class = group_pairs[i][1].item()
-                                    rel_tar_word = self.class_names_r[rel_tar]
-                                    sub_class_word = self.class_names[sub_class]
-                                    obj_class_word = self.class_names[obj_class]
-                                    pair = (sub_class_word, obj_class_word)
-                                    if rel_tar != 0 and pair in self.importance_dic_weight[rel_tar_word].keys():
-                                        weights[i] = self.importance_dic_weight[rel_tar_word][pair]
-                                    else:
-                                        weights[i] = 0.01
+                        ####################semantic#####################
+                        # weights = torch.ones_like(group_label,dtype=torch.float16)
+                        # if self.intra_class:
+                        #         for i in range(len(group_label)):
+                        #             rel_tar = group_label[i].item()
+                        #             sub_class = group_pairs[i][0].item()
+                        #             obj_class = group_pairs[i][1].item()
+                        #             rel_tar_word = self.class_names_r[rel_tar]
+                        #             sub_class_word = self.class_names[sub_class]
+                        #             obj_class_word = self.class_names[obj_class]
+                        #             pair = (sub_class_word, obj_class_word)
+                        #             if rel_tar != 0 and pair in self.importance_dic_weight[rel_tar_word].keys():
+                        #                 weights[i] = self.importance_dic_weight[rel_tar_word][pair]
+                        #             else:
+                        #                 weights[i] = 0.01
+                        #
+                        # else:
+                        #     for i in range(len(group_label)):
+                        #         weights[i] = self.weight_rate_matrix[-1][group_label[i]]
+                        # if self.addproto:
+                        #     add_losses[
+                        #         '%d_CE_bias_proto_loss' % (jdx + 1)] = 2*self.overweighted_weight * self.rel_criterion_loss(
+                        #         group_output_now_proto, group_label, weights)
+                        # add_losses['%d_CE_bias_loss' % (jdx + 1)] =self.overweighted_weight*self.rel_criterion_loss(group_output_now, group_label,weights)
 
+
+
+                        ####################################################################################
+
+                        # if self.use_mix==True:
+                        #     mixed_loss = lambda_*self.overweighted_weight * self.criterion_loss(
+                        #         group_output_now, label_a)+(1 - lambda_) * self.criterion_loss(
+                        #         group_output_now, label_b)
+                        #     add_losses['%d_CE_mix_loss' % (jdx + 1)] = mixed_loss
+                        #
+                        # else:
+                        # if self.use_mix == True:
+                        #     if self.onlyforeground == True:
+                        #         if foregroundcount[i] >= 2:
+                        #             foregroundloss = lambda_ * self.overweighted_weight * self.criterion_loss(
+                        #                 group_output_foreground, label_a) + (1 - lambda_) * self.criterion_loss(
+                        #                 group_output_foreground, label_b)
+                        #             backgroundloss = self.criterion_loss(group_output_background, background_label)
+                        #             mixed_loss = foregroundloss * len(foreground_label) / len(
+                        #                 group_label) + backgroundloss * len(background_label) / len(group_label)
+                        #             add_losses['%d_CE_mix_loss' % (jdx + 1)] = mixed_loss
+                        # else:
+                        # multi-sample
+
+                        if self.use_mix == True:
+                            if self.mixforeground == True:
+                                if foregroundcount[i] >= 2:
+                                    foregroundloss = lambda_ * self.overweighted_weight * self.criterion_loss(
+                                        group_output_foreground_mix, label_a) + (1 - lambda_) * self.criterion_loss(group_output_foreground_mix, label_b)
+                                    backgroundloss = self.criterion_loss(group_output_background,
+                                                                         background_label)
+                                    mixed_loss = foregroundloss * len(foreground_label) / len(
+                                        group_label) + backgroundloss * len(background_label) / len(group_label)
+                                    add_losses['%d_CE_mix_loss' % (jdx + 1)] = mixed_loss
+                                    # CE_loss = self.criterion_loss(group_output_now, group_label)
+                                    # CE_loss_diverse = self.criterion_loss(group_output_background,
+                                    #                                       background_label) * len(
+                                    #     background_label) / len(group_label) + self.criterion_loss(
+                                    #     group_output_foreground, foreground_label) * len(
+                                    #     foreground_label) / len(group_label)
+                                    #
+                                    # adsadasdad = 0
+                                #else:
+                                add_losses[
+                                        '%d_CE_loss' % (jdx + 1)] = self.norm_weight * self.criterion_loss(
+                                        group_output_now, group_label)
                         else:
-                            for i in range(len(group_label)):
-                                weights[i] = self.weight_rate_matrix[-1][group_label[i]]
-                        if self.addproto:
-                            add_losses[
-                                '%d_CE_bias_proto_loss' % (jdx + 1)] = 2*self.overweighted_weight * self.rel_criterion_loss(
-                                group_output_now_proto, group_label, weights)
-                        add_losses['%d_CE_bias_loss' % (jdx + 1)] =self.overweighted_weight*self.rel_criterion_loss(group_output_now, group_label,weights)
+                            self.forrate = 2
+                            if self.splitforeground==True:
+                                if foregroundcount[i]>0:
+                                    foregroundloss = self.forrate*self.criterion_loss(group_output_foreground,
+                                                                         foreground_label)
+                                    backgroundloss = self.criterion_loss(group_output_background,
+                                                                     background_label)
+                                    mixed_loss = foregroundloss * len(foreground_label) / len(
+                                        group_label) + backgroundloss * len(background_label) / len(group_label)
+                                else:
+                                    backgroundloss = self.criterion_loss(group_output_background,
+                                                                         background_label)
+                                    mixed_loss=backgroundloss
+                                add_losses['%d_CE_diverse_loss' % (jdx + 1)] = mixed_loss
+                            else:
+                                aaaaaa = 1
+                                if self.dynamicnet==True:
+                                    add_losses['%d_CE_dynamic_loss' % (jdx + 1)] = self.weightedCE(
+                                        group_output_now_so, group_output_now_union, group_label, self.dynamicgate,self.num_rel_cls)
+                                    add_losses['%d_CE_dynamic_loss_s' % (jdx + 1)] = self.weightedCE(
+                                        group_output_now_s, group_output_now_union, group_label, self.dynamicgate_S,self.num_rel_cls)
+                                    add_losses['%d_CE_dynamic_loss_o' % (jdx + 1)] = self.weightedCE(
+                                        group_output_now_o, group_output_now_union, group_label, self.dynamicgate_O,self.num_rel_cls)
+                                    add_losses['%d_CE_dynamic_loss_text' % (jdx + 1)] = self.weightedCE(
+                                        group_output_now_text, group_output_now_union, group_label, self.dynamicgate_text,self.num_rel_cls)
+                                    add_losses['%d_CE_dynamic_loss_pos' % (jdx + 1)] = self.weightedCE(
+                                        group_output_now_pos, group_output_now_union, group_label, self.dynamicgate_pos,self.num_rel_cls)
+                                else:
+                                    aaaaa=1
+                                    #########reweight############
+                                    weights = torch.ones_like(group_label,dtype=torch.float16)
+                                    for i in range(len(group_label)):
+                                        weights[i] = self.weight_rate_matrix[-1][group_label[i]]
+                                    add_losses['%d_CE_over_loss' % (jdx + 1)] = self.overweighted_weight * self.rel_criterion_loss(group_output_now, group_label, weights)
+
+
+
+
                         if self.penalty_v1:
                             add_losses['%d_reg_bias_loss' % (jdx + 1)] =self.overweighted_weight_p*self.penalty(group_output_now, group_label,weights)
-
                     else:
+                        #################################balance#############################################
                         if i == 1:
                             if self.addproto:
                                 add_losses[
                                     '%d_CE_bias_proto_loss' % (
                                                 jdx + 1)] = 2 * self.weighted_weight*self.criterion_loss(group_output_now_proto, group_label)
-                            add_losses['%d_CE_loss' % (jdx + 1)] = self.weighted_weight*self.criterion_loss(group_output_now, group_label)
+                            aaaaaa = 1
+
+                            # mixup
+                            # if self.use_mix==True:
+                            #     mixed_loss = lambda_*self.overweighted_weight * self.criterion_loss(
+                            #         group_output_now, label_a)+(1 - lambda_) * self.criterion_loss(
+                            #         group_output_now, label_b)
+                            #     add_losses['%d_CE_mix_loss' % (jdx + 1)] = mixed_loss
+                            # else:
+
+
+                            ####foreground
+                            # if self.onlyforeground == True:
+                            #         if foregroundcount[i] > 0:
+                            #             add_losses['%d_CE_loss' % (jdx + 1)] = self.weighted_weight*self.criterion_loss(group_output_now, group_label)
+                            # else:
+
+                            if self.dynamicnet == True:
+                            #     add_losses['%d_CE_dynamic_loss' % (jdx + 1)] = self.weightedCE(
+                            #         group_output_now_so,group_output_now_union, group_label, self.dynamicgate,self.num_rel_cls,
+                            #         )
+                            #     # add_losses['%d_CE_dynamic_loss_s' % (jdx + 1)] = self.weightedCE(
+                            #     #     group_output_now_s, group_output_now_union, group_label, self.dynamicgate_S,
+                            #     # )
+                            #     # add_losses['%d_CE_dynamic_loss_o' % (jdx + 1)] = self.weightedCE(
+                            #     #     group_output_now_o, group_output_now_union, group_label, self.dynamicgate_O,
+                            #     # )
+                            #     add_losses['%d_CE_dynamic_loss_text' % (jdx + 1)] = self.weightedCE(
+                            #         group_output_now_text, group_output_now_union, group_label, self.dynamicgate_text,self.num_rel_cls,
+                            #     )
+                            #     add_losses['%d_CE_dynamic_loss_pos' % (jdx + 1)] = self.weightedCE(
+                            #         group_output_now_pos, group_output_now_union, group_label, self.dynamicgate_pos,self.num_rel_cls,
+                            #     )
+                                add_losses['%d_CE_loss' % (jdx + 1)] = self.weighted_weight * self.criterion_loss(
+                                        group_output_now_union, group_label)
+                            else:
+                                aaaa=1
+                                add_losses['%d_CE_loss' % (jdx + 1)] = self.weighted_weight * self.criterion_loss(
+                                        group_output_now, group_label)
+
+                                ###############weight#######################
+                                # weights = torch.ones_like(group_label, dtype=torch.float16)
+                                # for i in range(len(group_label)):
+                                #     weights[i] = self.weight_rate_matrix[-1][group_label[i]]
+                                # add_losses[
+                                #     '%d_CE_bal_loss' % (jdx + 1)] = self.overweighted_weight * self.rel_criterion_loss(
+                                #     group_output_now, group_label, weights)
                             if self.penalty_v1:
                                 add_losses['%d_reg_loss' % (jdx + 1)] = self.weighted_weight_p*self.penalty(group_output_now, group_label)
-
+                        ###########################norm################################
                         else:
                             if self.addproto:
                                 add_losses[
                                     '%d_CE_proto_loss' % (
                                                 jdx + 1)] = 2 * self.norm_weight*self.criterion_loss(group_output_now_proto, group_label)
-                            add_losses['%d_CE_loss' % (jdx + 1)] = self.norm_weight*self.criterion_loss(group_output_now, group_label)
-                            if self.penalty_v1:
-                                add_losses['%d_reg_loss' % (jdx + 1)] = self.norm_weight_p*self.penalty(group_output_now, group_label)
+
+                            # if self.use_mix == True:
+                            #     if self.mixforeground == True:
+                            #         if foregroundcount[i] >= 2:
+                            #             foregroundloss = lambda_ * self.overweighted_weight * self.criterion_loss(
+                            #                 group_output_foreground_mix, label_a) + (1 - lambda_) * self.criterion_loss(
+                            #                 group_output_foreground_mix, label_b)
+                            #             backgroundloss = self.criterion_loss(group_output_background, background_label)
+                            #             mixed_loss = foregroundloss * len(foreground_label) / len(
+                            #                 group_label) + backgroundloss * len(background_label) / len(group_label)
+                            #             add_losses['%d_CE_mix_loss' % (jdx + 1)] = mixed_loss
+                            #             #CE_loss=self.criterion_loss(group_output_now, group_label)
+                            #             #CE_loss_diverse= self.criterion_loss(group_output_background, background_label) * len(background_label) / len(group_label)+ self.criterion_loss(group_output_foreground, foreground_label) * len(foreground_label) / len(group_label)
+                            #
+                            #             adsadasdad=0
+                            #
+                            #         else:
+                            #             add_losses['%d_CE_loss' % (jdx + 1)] = self.norm_weight * self.criterion_loss(
+                            #                 group_output_now, group_label)
+                            #
+                            # else:
+                            if self.onlyforeground == True:
+                                if foregroundcount[i] > 0:
+                                    add_losses['%d_CE_loss' % (jdx + 1)] = self.norm_weight*self.criterion_loss(group_output_now, group_label)
+                            else:
+                                aaaa=1
+                                # self.forrate = 0.5
+                                # if self.splitforeground == True:
+                                #     if foregroundcount[i] > 0:
+                                #         foregroundloss = self.forrate * self.criterion_loss(group_output_foreground,
+                                #                                                             foreground_label)
+                                #         backgroundloss = self.criterion_loss(group_output_background,
+                                #                                              background_label)
+                                #         mixed_loss = foregroundloss * len(foreground_label) / len(
+                                #             group_label) + backgroundloss * len(background_label) / len(group_label)
+                                #     else:
+                                #         backgroundloss = self.criterion_loss(group_output_background,
+                                #                                              background_label)
+                                #         mixed_loss = backgroundloss
+                                #     add_losses['%d_CE_diverse_loss' % (jdx + 1)] = mixed_loss
+                                # else:
+
+
+                                if self.dynamicnet==True:
+                                    add_losses['%d_CE_dynamic_loss' % (jdx + 1)] = self.weightedCE(
+                                        group_output_now_so, group_output_now_union, group_label, self.dynamicgate,self.num_rel_cls)
+                                    # add_losses['%d_CE_dynamic_loss_s' % (jdx + 1)] = self.weightedCE(
+                                    #     group_output_now_s, group_output_now_union, group_label, self.dynamicgate_S,
+                                    # )
+                                    # add_losses['%d_CE_dynamic_loss_o' % (jdx + 1)] = self.weightedCE(
+                                    #     group_output_now_o, group_output_now_union, group_label, self.dynamicgate_O,
+                                    # )
+                                    # add_losses['%d_CE_dynamic_loss_text' % (jdx + 1)] = self.weightedCE(
+                                    #     group_output_now_text, group_output_now_union, group_label, self.dynamicgate_text,self.num_rel_cls,
+                                    # )
+                                    # add_losses['%d_CE_dynamic_loss_pos' % (jdx + 1)] = self.weightedCE(
+                                    #     group_output_now_pos, group_output_now_union, group_label, self.dynamicgate_pos,self.num_rel_cls,
+                                    # )
+                                else:
+                                    aaaaa=1
+                                    add_losses[
+                                        '%d_CE_norm_loss' % (jdx + 1)] = self.overweighted_weight * self.criterion_loss(
+                                        group_output_now, group_label)
+
+                                if self.penalty_v1:
+                                    add_losses['%d_reg_loss' % (jdx + 1)] = self.norm_weight_p*self.penalty(group_output_now, group_label)
 
                 if self.penalty_v2:
                     losses = list(add_losses.values())
                     penalty = torch.var(torch.stack(list(add_losses.values())))
                     add_losses['IRM_penalty'] = self.penalty_v2_weight*penalty
+            ###########################single-env#############################################
             else:
+                if self.choose_background:
+                    if max_label==0:
+                        group_input_bg = prod_rep
+                        group_label_bg = rel_labels
+                        group_pairs_bg = pair_pred
+                        if self.base_encoder == 'Self-Attention':
+                            group_visual_bg = visual_rep
+                    else:
+                        cur_chosen_matrix=[]
+                        cur_chosen_matrix_background= []
+                        for i in range(len(rel_labels)):
+                            random_num = random.random()
+                            rel_tar = rel_labels[i].item()
+
+                            if rel_tar == 0:
+                                cur_chosen_matrix_background.append(i)
+                            else:
+                                if self.sample_forground:
+                                    if random_num <= self.sample_forground_rate:
+                                        cur_chosen_matrix.append(i)
+                                else:
+                                    cur_chosen_matrix.append(i)
+
+                        if self.base_encoder == 'Self-Attention':
+                            group_visual_fo = visual_rep[cur_chosen_matrix]
+                        group_input_fo = prod_rep[cur_chosen_matrix]
+                        group_label_fo = rel_labels[cur_chosen_matrix]
+                        group_pairs_fo = pair_pred[cur_chosen_matrix]
+
+                        if self.base_encoder == 'Self-Attention':
+                            group_visual_bg = visual_rep[cur_chosen_matrix_background]
+                        group_input_bg = prod_rep[cur_chosen_matrix_background]
+                        group_label_bg = rel_labels[cur_chosen_matrix_background]
+                        group_pairs_bg = pair_pred[cur_chosen_matrix_background]
+
+                    if self.bgmix:
+                        lambda_ = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+                        idx = torch.randperm(group_input_bg.size(0))  # random打乱
+                        input_a, input_b = group_input_bg, group_input_bg[idx]
+
+                        pair_a, pair_b = group_pairs_bg, group_pairs_bg[idx]
+                        mixed_input = lambda_ * input_a + (1 - lambda_) * input_b
+                        if self.base_encoder == 'Self-Attention':
+                            input_a_v, input_b_v = group_visual_bg, group_visual_bg[idx]
+                            visual_mixed_input = lambda_ * input_a_v + (1 - lambda_) * input_b_v
+
+
                 if self.addproto:
                     # proto
                     predicate_proto = self.W_pred(self.rel_embed.weight)
@@ -1549,40 +2609,308 @@ class EICR_model(nn.Module):
                     rel_dists_proto = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()  # <r_norm, c_norm> / τ
 
                 if self.base_encoder== 'Self-Attention':
-                    rel_dists = self.rel_compress(visual_rep) + self.ctx_compress(prod_rep)
-                    self.use_bias = False
+                    if self.choose_background:
+                        if self.bgmix:
+                            rel_dists_bg_mix = self.rel_compress(visual_mixed_input) + self.ctx_compress(mixed_input)
+                        if max_label==0:
+                            rel_dists_bg = self.rel_compress(group_visual_bg) + self.ctx_compress(group_input_bg)
+                        else:
+                            rel_dists_fo = self.rel_compress(group_visual_fo) + self.ctx_compress(group_input_fo)
+                            rel_dists_bg = self.rel_compress(group_visual_bg) + self.ctx_compress(group_input_bg)
+                    else:
+                        rel_dists = self.rel_compress(visual_rep) + self.ctx_compress(prod_rep)
+
+                    #self.use_bias = False
                 else:
                     if self.base_encoder== 'VCTree':
-                        rel_dists = self.rel_compress(prod_rep)
+                        # rel_dists = self.rel_compress(prod_rep)
+                        if self.choose_background:
+                            if self.bgmix:
+                                rel_dists_bg_mix = self.ctx_compress(mixed_input)
+                            if max_label == 0:
+                                rel_dists_bg = self.ctx_compress(group_input_bg)
+                            else:
+                                rel_dists_fo = self.ctx_compress(group_input_fo)
+                                rel_dists_bg = self.ctx_compress(group_input_bg)
+                        else:
+                            rel_dists = self.ctx_compress(prod_rep)
                     else:
-                        rel_dists = self.rel_compress(prod_rep)
+                        if self.multi_net:
+                            rel_dists_0 = self.rel_compress_0(prod_rep)
+                            rel_dists_1 = self.rel_compress_1(prod_rep)
+                            rel_dists_2 = self.rel_compress_2(prod_rep)
+                        else:
+                            if self.dynamicnet==True:
+                                output_union = self.rel_compress(union_feat)
+                                output_so = self.rel_so_classifier(SO_feat)
+
+                                output_s = self.rel_so_classifier_S(S_feat)
+                                output_o = self.rel_so_classifier_O(O_feat)
+
+                                output_pos = self.rel_classifier_pos(pos_union)
+                                output_text = self.rel_classifier_text(text_union)
+
+                                self.dynamicgate = self.use_ROI_gate(union_feat)
+                                self.dynamicgate = self.sigmoid_layer(self.dynamicgate)
 
 
+                                self.dynamicgate_S = self.use_ROI_gate_S(union_feat)
+                                self.dynamicgate_S = self.sigmoid_layer(self.dynamicgate_S)
+                                self.dynamicgate_O = self.use_ROI_gate_O(union_feat)
+                                self.dynamicgate_O = self.sigmoid_layer(self.dynamicgate_O)
+
+                                self.dynamicgate_pos = self.use_ROI_gate_pos(union_feat)
+                                self.dynamicgate_pos = self.sigmoid_layer(self.dynamicgate_pos)
+                                self.dynamicgate_text = self.use_ROI_gate_text(union_feat)
+                                self.dynamicgate_text = self.sigmoid_layer(self.dynamicgate_text)
+                            else:
+                                if self.choose_background:
+                                    if self.bgmix:
+                                        rel_dists_bg_mix = self.rel_compress(mixed_input)
+                                    if max_label==0:
+                                        rel_dists_bg = self.rel_compress(group_input_bg)
+                                    else:
+                                        rel_dists_fo = self.rel_compress(group_input_fo)
+                                        rel_dists_bg = self.rel_compress(group_input_bg)
+
+                                else:
+                                    rel_dists = self.rel_compress(prod_rep)
 
                 if self.use_bias:
                     if self.addproto:
                         rel_dists_proto = rel_dists_proto + self.freq_bias.index_with_labels(pair_pred.long())
-
-
                     else:
-                        rel_dists = rel_dists + self.freq_bias.index_with_labels(pair_pred.long())
+                        if self.multi_net:
+                            rel_list=[]
+                            rel_dists_0 = rel_dists_0 + self.freq_bias.index_with_labels(pair_pred.long())
+                            rel_list.append(rel_dists_0)
+                            rel_dists_1 = rel_dists_1 + self.freq_bias.index_with_labels(pair_pred.long())
+                            rel_list.append(rel_dists_1)
+                            rel_dists_2 = rel_dists_2 + self.freq_bias.index_with_labels(pair_pred.long())
+                            rel_list.append(rel_dists_2)
+                            rel_dists = torch.mean(torch.stack(rel_list), dim=0)
+                        else:
+                            if self.dynamicnet == True:
+                                output_union = output_union + self.freq_bias.index_with_labels(
+                                    pair_pred.long())
+                                output_so = output_so + self.freq_bias.index_with_labels(
+                                    pair_pred.long())
+
+                                output_s = output_s + self.freq_bias.index_with_labels(
+                                    pair_pred.long())
+                                output_o = output_o + self.freq_bias.index_with_labels(
+                                    pair_pred.long())
+                            else:
+                                if self.choose_background:
+                                    if self.bgmix:
+                                        rel_dists_bg_mix = rel_dists_bg_mix+lambda_ * self.freq_bias.index_with_labels(
+                                            pair_a.long()) + (1 - lambda_) * self.freq_bias.index_with_labels(
+                                            pair_b.long())
+                                    if max_label==0:
+                                        rel_dists_bg = rel_dists_bg + self.freq_bias.index_with_labels(
+                                            group_pairs_bg.long())
+                                    else:
+                                        rel_dists_fo = rel_dists_fo + self.freq_bias.index_with_labels(group_pairs_fo.long())
+                                        rel_dists_bg = rel_dists_bg + self.freq_bias.index_with_labels(group_pairs_bg.long())
+
+                                else:
+                                    rel_dists = rel_dists + self.freq_bias.index_with_labels(pair_pred.long())
 
                 if self.use_causal:
                     self.qhat = self.update_qhat(torch.softmax(rel_dists.detach(), dim=-1), self.qhat,
-                                                 momentum=0.99)
-                    delta_logits = torch.log(self.qhat)
-                    rel_dists = rel_dists + self.causal_weight * delta_logits
+                                                 momentum=0.99)############momentum=0.99###########
+                    #delta_logits = torch.log(self.qhat)
+
+                    #########use predefined#############
+                    delta_logits = torch.log(self.qhat_prior)
+                    delta_logits[0] = torch.max(delta_logits[1:])
+                    delta_logits=delta_logits.cuda()
+                    ###################
+
+
+                    #delta_logits[0][0]=torch.min(delta_logits)
+                    #delta_logits[0][0] = torch.median(delta_logits[0][1:])
+                    #delta_logits[0][0] = torch.max(delta_logits[0][1:])
+                    # if self.iter_2==1:
+                    #
+                    #     from maskrcnn_benchmark.utils.miscellaneous import mkdir
+                    #     mkdir('./GQA_VCTree_sgdet_bgmax_causal09')
+                    if self.iter_2%5000==0:
+                        print("###################################################")
+                        print("qhat:",delta_logits)
+                        print("qhat_logit:", self.qhat)
+
+                        #np.savetxt('./GQA_VCTree_sgdet_bgmax_causal09/qhat_%d.csv'%self.iter_2, delta_logits.detach().cpu().numpy(), fmt='%f', delimiter=',',footer='\n')
+                    #if self.iter_2>=25000:
+                    rel_dists_causal = rel_dists + self.causal_weight * delta_logits
                     if self.addproto:
                         self.qhat_proto = self.update_qhat(torch.softmax(rel_dists_proto.detach(), dim=-1), self.qhat_proto,
                                                            momentum=0.99)
                         delta_logits_proto = torch.log(self.qhat_proto)
                         rel_dists_proto = rel_dists_proto + self.causal_weight * delta_logits_proto
 
+
+                if self.use_causal_test==True and self.use_causal==False:
+
+                    self.qhat = self.update_qhat(torch.softmax(rel_dists.detach(), dim=-1), self.qhat,
+                                                 momentum=0.99)
+                    delta_logits = torch.log(self.qhat)
+                    if self.iter_2==1:
+
+                        from maskrcnn_benchmark.utils.miscellaneous import mkdir
+                        mkdir('./GQA_VCTree_predcls_EIL_causal09')
+
+
+                    if self.iter_2%5000==0:
+                        print("###################################################")
+                        print("qhat:",self.qhat)
+                        print("rel:", torch.softmax(rel_dists.detach(), dim=-1).mean(dim=0))
+                        np.savetxt('./GQA_VCTree_predcls_EIL_causal09/qhat_%d.csv' % self.iter_2,
+                                   delta_logits.detach().cpu().numpy(), fmt='%f', delimiter=',', footer='\n')
+
+
+
+
+                if self.NCL:
+                    if self.multi_net:
+                        loss_relation_NCL=0
+                        for i in range(len(rel_list)):
+                            class_select = rel_list[i].scatter(1, rel_labels.unsqueeze(1), 999999)  # 由第一个backbone select
+                            class_select_include_target = class_select.sort(descending=True, dim=1)[1][:,
+                                                          :self.hcm_N]  # 256 30
+                            mask = torch.zeros_like(rel_list[i]).scatter(1, class_select_include_target, 1)
+
+                            rel_dists_HCM = rel_list[i] * mask
+
+                            loss_relation_NCL += self.criterion_loss(rel_dists_HCM, rel_labels)
+                        #KL
+                        classifier_num = len(rel_list)  # factor 0.6
+                        if classifier_num == 1:
+                            return 0
+                        logits_softmax = []
+                        logits_logsoftmax = []
+                        for i in range(classifier_num):
+                            logits_softmax.append(F.softmax(rel_list[i], dim=1))
+                            logits_logsoftmax.append(torch.log(logits_softmax[i] + 1e-9))
+
+                        loss_mutual = 0
+                        for i in range(classifier_num):
+                            for j in range(classifier_num):
+                                if i == j:
+                                    continue
+                                loss_mutual += 1 * F.kl_div(logits_logsoftmax[i], logits_softmax[j],
+                                                            reduction='batchmean')
+                        loss_mutual /= (classifier_num - 1)
+                        add_losses['rel_loss_multi'] = loss_mutual
+
+                        add_losses['rel_loss_NCL'] = loss_relation_NCL
+                    else:
+                        class_select = rel_dists.scatter(1, rel_labels.unsqueeze(1), 999999)  # 由第一个backbone select
+                        class_select_include_target = class_select.sort(descending=True, dim=1)[1][:, :self.hcm_N]  # 256 30
+                        mask = torch.zeros_like(rel_dists).scatter(1, class_select_include_target, 1)
+
+                        rel_dists_HCM=rel_dists*mask
+
+                        loss_relation_NCL = self.criterion_loss(rel_dists_HCM, rel_labels)
+                        add_losses['rel_loss_NCL'] = loss_relation_NCL
+
                 if self.addproto:
                     loss_proto = self.criterion_loss(rel_dists_proto, rel_labels)
                     add_losses['rel_loss_proto'] = 1 * loss_proto
-                loss_relation = self.criterion_loss(rel_dists, rel_labels)
-                add_losses['rel_loss'] = loss_relation
+
+                if self.multi_net:
+                    if self.balpoe:
+                        for idx in range(3):
+                            if idx == 0:
+                                adjusted_expert_logits = rel_list[idx] + self.get_bias_from_index(idx)
+                                baseloss=self.criterion_loss(adjusted_expert_logits, rel_labels)
+                                add_losses['%d_rel_loss' % (idx + 1)] = self.balpoe_weight * self.criterion_loss(
+                                    adjusted_expert_logits, rel_labels)
+                            else:
+                                if idx == 2:
+                                    adjusted_expert_logits = rel_list[idx] + self.get_bias_from_index(idx)
+                                    add_losses['%d_rel_loss' % (idx + 1)] = self.balpoe_weight * self.criterion_loss(adjusted_expert_logits, rel_labels)
+                                # else:
+                                #     adjusted_expert_logits = rel_list[idx] + self.get_bias_from_index(idx)
+                                #     add_losses['%d_rel_loss' % (idx + 1)] = self.balpoe_weight * self.criterion_loss(
+                                #         adjusted_expert_logits, rel_labels)
+                    else:
+                        loss_relation = self.criterion_loss(rel_list[0], rel_labels)+ self.criterion_loss(rel_list[1], rel_labels) +self.criterion_loss(rel_list[2], rel_labels)
+                        add_losses['rel_loss'] = loss_relation
+                else:
+                    if self.balpoe:
+                        for idx in range(3):
+                            if idx==0:
+                                adjusted_expert_logits = rel_dists + self.get_bias_from_index(idx)
+                                add_losses['%d_rel_loss' % (idx + 1)] = 0.7*self.balpoe_weight * self.criterion_loss(
+                                    adjusted_expert_logits, rel_labels)
+                            else:
+                                adjusted_expert_logits = rel_dists + self.get_bias_from_index(idx)
+                                add_losses['%d_rel_loss' % (idx + 1)] = self.balpoe_weight * self.criterion_loss(adjusted_expert_logits, rel_labels)
+                    else:
+                        if self.dynamicnet == True:
+                            add_losses['CE_dynamic_loss'] = self.weightedCE(
+                                output_so, output_union, rel_labels, self.dynamicgate,
+                            )
+                            add_losses['CE_dynamic_loss_s'] = self.weightedCE(
+                                output_s, output_union, rel_labels, self.dynamicgate_S,
+                            )
+                            add_losses['CE_dynamic_loss_o' ] = self.weightedCE(
+                                output_o, output_union, rel_labels, self.dynamicgate_O,
+                            )
+                            add_losses['CE_dynamic_loss_text'] = self.weightedCE(
+                                output_pos, output_union, rel_labels, self.dynamicgate_pos,
+                            )
+                            add_losses['CE_dynamic_loss_pos' ] = self.weightedCE(
+                                output_text, output_union, rel_labels, self.dynamicgate_text,
+                            )
+                        else:
+                            ######rwt
+                            # weights = torch.ones_like(rel_labels,dtype=torch.float16)
+                            # for i in range(len(rel_labels)):
+                            #     weights[i] = self.weight_rate_matrix[-1][rel_labels[i]]
+                            # add_losses['rel_rwt_loss'] = self.rel_criterion_loss(rel_dists, rel_labels, weights)
+
+
+
+                            if self.use_nms and max_label > 0:
+                                refine_labels=[]
+                                rel_idx=0
+                                for idx in range(len(rel_pair_idxs)):
+
+                                    rel_dist_single=rel_dists[rel_idx:rel_idx+rel_lenth[idx]]
+                                    rel_labels_single=rel_labels[rel_idx:rel_idx+rel_lenth[idx]]
+                                    rel_idx=rel_idx+rel_lenth[idx]
+                                    pred_rels  = self.rel_nms(proposals[idx], rel_labels_single, rel_pair_idxs[idx], torch.softmax(rel_dist_single.detach(),dim=-1), 0.3)
+                                    refine_labels.append(pred_rels)
+
+                                rel_labels = cat(refine_labels, dim=0)
+
+                            if self.choose_background:
+
+                                if max_label==0:
+                                    loss_relation_bg = self.criterion_loss(rel_dists_bg, group_label_bg)
+                                    if self.bgmix:
+                                        loss_relation_bg += lambda_*self.criterion_loss(rel_dists_bg_mix, group_label_bg)+ (1 - lambda_) * self.criterion_loss(rel_dists_bg_mix, group_label_bg)
+                                    add_losses['rel_loss']=loss_relation_bg
+                                else:
+
+                                    loss_relation_bg = self.criterion_loss(rel_dists_bg, group_label_bg)
+                                    loss_relation_fo = self.criterion_loss(rel_dists_fo, group_label_fo)
+                                    if self.only_forground:
+                                        loss_all=loss_relation_fo
+                                    else:
+                                        loss_all=loss_relation_fo*len(rel_dists_fo) / (len(rel_dists_fo)+len(rel_dists_bg)) +self.bgweight* loss_relation_bg*len(rel_dists_bg) / (len(rel_dists_fo)+len(rel_dists_bg))
+                                    if self.bgmix:
+                                        loss_all += (lambda_*self.criterion_loss(rel_dists_bg_mix, group_label_bg)+ (1 - lambda_) * self.criterion_loss(rel_dists_bg_mix, group_label_bg))*len(rel_dists_bg) / (len(rel_dists_fo)+len(rel_dists_bg))
+                                    add_losses['rel_loss']=loss_all
+
+                            else:
+                                loss_relation = self.criterion_loss(rel_dists, rel_labels)
+                                add_losses['rel_loss'] = loss_relation
+                            if self.use_causal: #and self.iter_2>=25000:
+                                loss_relation_causal = self.criterion_loss(rel_dists_causal, rel_labels)
+                                add_losses['rel_loss_causal'] = loss_relation_causal
 
 
 
@@ -1598,6 +2926,8 @@ class EICR_model(nn.Module):
 
 
             return None, None, add_losses
+
+        #############################test#########################################################
         else:
             if self.addproto:
                 predicate_proto = self.W_pred(self.rel_embed.weight)
@@ -1611,27 +2941,106 @@ class EICR_model(nn.Module):
                 rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()
             else:
                 if self.base_encoder== 'Self-Attention':
-                    rel_dists = self.rel_compress(visual_rep) + self.ctx_compress(prod_rep)
-                    #self.use_bias = False
+                    if self.dynamicnet:
+                        # self.gate_dyn=0.9
+                        # self.dynamicgate = self.use_ROI_gate(SO_feat)
+                        rel_dists = self.rel_compress(union_feat) + self.ctx_compress(prod_rep)
+                    else:
+                        rel_dists = self.rel_compress(visual_rep) + self.ctx_compress(prod_rep)
+                    #self.use_bias = False###############EIL和EICR都为True##########
                 else:
                     if self.base_encoder== 'VCTree':
-                        rel_dists = self.ctx_compress(prod_rep)
+                        if self.dynamicnet:
+                            # self.gate_dyn=0.9
+                            # self.dynamicgate = self.use_ROI_gate(SO_feat)
+                            rel_dists = self.ctx_compress(union_feat)
+                        else:
+                            rel_dists = self.ctx_compress(prod_rep)
                     else:
-                        rel_dists = self.rel_compress(prod_rep)
+                        if self.multi_net:
+                            rel_dists_0 = self.rel_compress_0(prod_rep)
+                            rel_dists_1 = self.rel_compress_1(prod_rep)
+                            rel_dists_2 = self.rel_compress_2(prod_rep)
+                        else:
+                            if self.dynamicnet:
+                                #self.gate_dyn=0.9
+                                #self.dynamicgate = self.use_ROI_gate(SO_feat)
+                                group_input_union=union_feat
+
+
+                                self.dynamicgate = self.use_ROI_gate(group_input_union)
+                                self.dynamicgate = self.sigmoid_layer(self.dynamicgate)
+
+                                self.dynamicgate_S = self.use_ROI_gate_S(group_input_union)
+                                self.dynamicgate_S = self.sigmoid_layer(self.dynamicgate_S)
+                                self.dynamicgate_O = self.use_ROI_gate_O(group_input_union)
+                                self.dynamicgate_O = self.sigmoid_layer(self.dynamicgate_O)
+                                #
+                                self.dynamicgate_pos = self.use_ROI_gate_pos(group_input_union)
+                                self.dynamicgate_pos = self.sigmoid_layer(self.dynamicgate_pos)
+                                self.dynamicgate_text = self.use_ROI_gate_text(group_input_union)
+                                self.dynamicgate_text = self.sigmoid_layer(self.dynamicgate_text)
+
+
+                                rel_dists = self.rel_compress(union_feat)
+                            else:
+                                rel_dists = self.rel_compress(prod_rep)
+
             if self.use_bias:
-                rel_dists = rel_dists + self.freq_bias.index_with_labels(pair_pred.long())
+                if self.multi_net:
+                    rel_list = []
+                    rel_dists_0 = rel_dists_0 + self.freq_bias.index_with_labels(pair_pred.long())
+                    rel_list.append(rel_dists_0)
+                    rel_dists_1 = rel_dists_1 + self.freq_bias.index_with_labels(pair_pred.long())
+                    rel_list.append(rel_dists_1)
+                    rel_dists_2 = rel_dists_2 + self.freq_bias.index_with_labels(pair_pred.long())
+                    rel_list.append(rel_dists_2)
+                    rel_dists = torch.mean(torch.stack(rel_list), dim=0)
+                else:
+                    rel_dists = rel_dists + self.freq_bias.index_with_labels(pair_pred.long())
+
+            if self.use_causal_test==True:
+
+                self.load_prior="/yourdatapath/newreason/SHA/GQA_motifs_sgdet_bgmax_causal09/qhat_235000.csv"
+                #############loadtxt########
+                # qhat=np.loadtxt("/yourdatapath/SHA/finstat.txt", delimiter='\t')
+                #
+                # qhat=torch.Tensor(qhat).cuda()
+                #
+                # delta_logits = torch.log(qhat)
+                ######################################
+                delta_logits = np.loadtxt(self.load_prior, delimiter=',')
+                delta_logits = torch.Tensor(delta_logits).cuda()
+                if self.iter_test==0:
+                    print("############################loadprior##############################################")
+                    print("load prior:",self.load_prior)
+                    print("####################################################################################")
+                self.iter_test+=1
+
+                #delta_logits=torch.log(self.qhat_prior).cuda()
+
+                rel_dists_causal = rel_dists - self.causal_weight_test * delta_logits
 
 
 
+                #########use predefined#############
+                #self.qhat_prior=torch.tensor(self.sample_rate[0])
+                #delta_logits = torch.log(self.qhat_prior)
+                #delta_logits=delta_logits.cuda()
+                #rel_dists_causal = rel_dists - self.causal_weight_test * delta_logits
+                ###################
 
+            if self.use_causal_test==True:
+                rel_dists = rel_dists_causal.split(num_rels, dim=0)
+            else:
+                rel_dists = rel_dists.split(num_rels, dim=0)
 
-            rel_dists = rel_dists.split(num_rels, dim=0)
             obj_dists = obj_dists.split(num_objs, dim=0)
             return obj_dists, rel_dists, add_losses
 
     def generate_muti_networks(self, num_cls):
             '''generate all the hier-net in the model, need to set mannually if use new hier-class'''
-            if self.base_encoder == "Self-Attention" or self.base_encoder == "VCTree":
+            if self.base_encoder == "Self-Attention" or self.base_encoder == "VCTree":######################EILand EICR
                 self.rel_classifer_1 = nn.Linear(self.pooling_dim, self.max_group_element_number_list[0] + 1)
                 self.rel_classifer_2 = nn.Linear(self.pooling_dim, self.max_group_element_number_list[1] + 1)
                 self.rel_classifer_3 = nn.Linear(self.pooling_dim, self.max_group_element_number_list[2] + 1)
@@ -2670,11 +4079,21 @@ class MotifsLikePredictor(nn.Module):
 
         prod_rep = self.post_cat(prod_rep)
 
+
+        #self.use_vision = False
+        self.use_SO = True
         if self.use_vision:
             if self.union_single_not_match:
                 prod_rep = prod_rep * self.up_dim(union_features)
             else:
-                prod_rep = prod_rep * union_features
+                if self.use_SO:
+                    prod_rep = prod_rep * union_features
+                else:
+                    prod_rep = union_features
+
+
+
+
         if self.use_CLIP:
             new_obj_feats = []
             scoremaps = []
@@ -3487,8 +4906,8 @@ class MotifsLike_GCL(nn.Module):
 
                 tsne_tensors=torch.stack(self.cur_chosen_tensor_tsne[1])
                 tsne_tensors = np.array(tsne_tensors.cpu())
-                np.save('/data/myk/SHA/TSNE/'+str(self.iter_2)+'reweight_'+'Motifs_'+'tensors'+'.npy', tsne_tensors)
-                np.save('/data/myk/SHA/TSNE/' + str(self.iter_2) + 'reweight_' + 'Motifs_' +'labels'+ '.npy', label_ids)
+                np.save('/yourdatapath/SHA/TSNE/'+str(self.iter_2)+'reweight_'+'Motifs_'+'tensors'+'.npy', tsne_tensors)
+                np.save('/yourdatapath/SHA/TSNE/' + str(self.iter_2) + 'reweight_' + 'Motifs_' +'labels'+ '.npy', label_ids)
                 # 解释：Save an array to a binary file in NumPy .npy format。以“.npy”格式将数组保存到二进制文件中。
                 # 参数：
                 # file 要保存的文件名称，需指定文件保存路径，如果未设置，保存到默认路径。其文件拓展名为.npy
@@ -3502,7 +4921,7 @@ class MotifsLike_GCL(nn.Module):
                            markerscale=0.2,
                            bbox_to_anchor=(0.9, 0), ncol=12, prop=font1, handletextpad=0.1)
 
-                plt.savefig('/data/myk/SHA/TSNE/'+str(self.iter_2)+'reweight_'+'Motifs_'+'.png', format='png',dpi=300, bbox_inches='tight')
+                plt.savefig('/yourdatapath/TSNE/'+str(self.iter_2)+'reweight_'+'Motifs_'+'.png', format='png',dpi=300, bbox_inches='tight')
                 plt.show()
 
 

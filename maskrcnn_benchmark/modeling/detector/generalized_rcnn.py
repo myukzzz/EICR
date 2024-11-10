@@ -247,7 +247,7 @@ class GeneralizedRCNN(nn.Module):
 
 
 
-        ##################################################################
+        ##############################froze####################################
         #DensCLIP
         if self.use_CLIP:
             feat=self.backbone.body(images.tensors)
@@ -270,7 +270,7 @@ class GeneralizedRCNN(nn.Module):
 
 
         #print("1111111111111111111")
-
+        ###################froze####################
         proposals, proposal_losses = self.rpn(images, features, targets)
 
         # x_global, x_local = self.attnpool(features[3])
@@ -278,7 +278,7 @@ class GeneralizedRCNN(nn.Module):
         #print("roihead:",self.roi_heads)#ROIhead
         #targets:B*num_of_box*4
         #targets_extra_fields:B*num_of_box^2
-        if self.roi_heads:
+        if self.roi_heads:##############################################
             #detector_losses={}
             #x, detections, loss_box = self.roi_heads.box(features, proposals, targets)
             #x, result, relation_losses = self.roi_heads.relation(features, detections, targets, logger)

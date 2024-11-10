@@ -54,7 +54,7 @@ class PostProcessor(nn.Module):
                 # just use attribute feature, do not actually predict attribute
                 self.attribute_on = False
                 finetune_obj_logits = refine_logits
-        else:
+        else:#####################
             finetune_obj_logits = refine_logits
 
         results = []
@@ -69,11 +69,11 @@ class PostProcessor(nn.Module):
             num_obj_bbox = obj_class_prob.shape[0]
             num_obj_class = obj_class_prob.shape[1]
 
-            if self.use_gt_box:
+            if self.use_gt_box:##########################
                 obj_scores, obj_pred = obj_class_prob[:, 1:].max(dim=1)
                 obj_pred = obj_pred + 1
             else:
-                # NOTE: by kaihua, apply late nms for object prediction
+                # NOTE: by xxxxx, apply late nms for object prediction
                 obj_pred = obj_prediction_nms(box.get_field('boxes_per_cls'), obj_logit, self.later_nms_pred_thres)
                 obj_score_ind = torch.arange(num_obj_bbox, device=obj_logit.device) * num_obj_class + obj_pred
                 obj_scores = obj_class_prob.view(-1)[obj_score_ind]#最大logits对应score
@@ -102,7 +102,7 @@ class PostProcessor(nn.Module):
             rel_class_prob = F.softmax(rel_logit, -1)
             rel_scores, rel_class = rel_class_prob[:, 1:].max(dim=1)
             rel_class = rel_class + 1
-            # TODO Kaihua: how about using weighted some here?  e.g. rel*1 + obj *0.8 + obj*0.8
+            # TODO xxxxx: how about using weighted some here?  e.g. rel*1 + obj *0.8 + obj*0.8
             triple_scores = rel_scores * obj_scores0 * obj_scores1
             _, sorting_idx = torch.sort(triple_scores.view(-1), dim=0, descending=True)
             rel_pair_idx = rel_pair_idx[sorting_idx]
@@ -114,7 +114,7 @@ class PostProcessor(nn.Module):
             boxlist.add_field('pred_rel_labels', rel_labels) # (#rel, )
             # should have fields : rel_pair_idxs, pred_rel_class_prob, pred_rel_labels, pred_labels, pred_scores
             # Note
-            # TODO Kaihua: add a new type of element, which can have different length with boxlist (similar to field, except that once 
+            # TODO xxxxx: add a new type of element, which can have different length with boxlist (similar to field, except that once 
             # the boxlist has such an element, the slicing operation should be forbidden.)
             # it is not safe to add fields about relation into boxlist!
             results.append(boxlist)

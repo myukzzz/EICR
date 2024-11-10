@@ -224,7 +224,7 @@ class VCTreeLSTMContext(nn.Module):
         edge_ctxs = cat(edge_ctxs, dim=0)
         return edge_ctxs
 
-    def forward(self, x, proposals, rel_pair_idxs, logger=None, all_average=False, ctx_average=False):
+    def forward(self, x, proposals, rel_pair_idxs, logger=None, all_average=False, ctx_average=False,return_pos=False):
         num_objs = [len(b) for b in proposals]# x-(B*N)*4096; proposals-bbox&主宾框标签;
         # labels will be used in DecoderRNN during training (for nms)
         if self.training or self.cfg.MODEL.ROI_RELATION_HEAD.USE_GT_BOX:#sgcl/sgdet
@@ -274,6 +274,8 @@ class VCTreeLSTMContext(nn.Module):
             self.untreated_obj_feat = self.moving_average(self.untreated_obj_feat, obj_pre_rep)
             self.untreated_edg_feat = self.moving_average(self.untreated_edg_feat, cat((obj_embed2, x), -1))
 
+        if return_pos==True:
+            return obj_dists, obj_preds, edge_ctx,bi_preds,pos_embed,obj_embed2
         return obj_dists, obj_preds, edge_ctx, bi_preds
 
     def moving_average(self, holder, input):

@@ -89,16 +89,16 @@ class RelationFeatureExtractor(nn.Module):
 
         # rectangle feature. size (total_num_rel, in_channels, POOLER_RESOLUTION, POOLER_RESOLUTION)
         rect_inputs = torch.cat(rect_inputs, dim=0)#proposal的resize矩形
-        rect_features = self.rect_conv(rect_inputs)
+        rect_features = self.rect_conv(rect_inputs)##############空间特征
 
         # union visual feature. size (total_num_rel, in_channels, POOLER_RESOLUTION, POOLER_RESOLUTION)
-        union_vis_features = self.feature_extractor.pooler(x, union_proposals)
+        union_vis_features = self.feature_extractor.pooler(x, union_proposals)#######FPN特征提取
         # merge two parts
         if self.separate_spatial:#false
             region_features = self.feature_extractor.forward_without_pool(union_vis_features)
             spatial_features = self.spatial_fc(rect_features.view(rect_features.size(0), -1))
             union_features = (region_features, spatial_features)
-        else:
+        else:##########################
             union_features = union_vis_features + rect_features
             union_features = self.feature_extractor.forward_without_pool(union_features) # (total_num_rel, out_channels)
         #False
